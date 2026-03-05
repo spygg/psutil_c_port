@@ -17,6 +17,11 @@ add_executable(example example.c)
 target_include_directories(example PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(example psutil)
 
+# Link pthread library for Linux
+if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+    target_link_libraries(example pthread)
+endif()
+
 # Installation
 install(TARGETS example
     RUNTIME DESTINATION bin

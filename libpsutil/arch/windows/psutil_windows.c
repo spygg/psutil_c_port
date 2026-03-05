@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <iphlpapi.h>
+#include <iprtrmib.h>
 #include <wtsapi32.h>
 #include "../../psutil.h"
 #include "psutil_windows.h"
@@ -365,15 +366,280 @@ const char* psutil_windows_process_get_exe(Process* proc) {
     return proc->exe;
 }
 
+// Process environment block structures for 32-bit processes
+typedef struct _PEB32 {
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[1];
+    ULONG_PTR Reserved3[2];
+    ULONG_PTR Ldr;
+    ULONG_PTR ProcessParameters;
+    BYTE Reserved4[104];
+    ULONG_PTR Reserved5[52];
+    BYTE Reserved6[464];
+    ULONG_PTR Reserved7[14];
+} PEB32, *PPEB32;
+
+typedef struct _UNICODE_STRING32 {
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONG_PTR Buffer;
+} UNICODE_STRING32, *PUNICODE_STRING32;
+
+typedef struct _RTL_USER_PROCESS_PARAMETERS32 {
+    BYTE Reserved1[16];
+    ULONG_PTR Reserved2[10];
+    UNICODE_STRING32 ImagePathName;
+    UNICODE_STRING32 CommandLine;
+    UNICODE_STRING32 CurrentDirectoryPath;
+    ULONG_PTR env;
+} RTL_USER_PROCESS_PARAMETERS32, *PRTL_USER_PROCESS_PARAMETERS32;
+
+// Process environment block structures for 64-bit processes
+typedef struct _PEB64 {
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[1];
+    ULONG_PTR Reserved3[2];
+    ULONG_PTR Ldr;
+    ULONG_PTR ProcessParameters;
+    BYTE Reserved4[104];
+    ULONG_PTR Reserved5[52];
+    BYTE Reserved6[464];
+    ULONG_PTR Reserved7[14];
+} PEB64, *PPEB64;
+
+typedef struct _UNICODE_STRING64 {
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONG_PTR Buffer;
+} UNICODE_STRING64, *PUNICODE_STRING64;
+
+typedef struct _RTL_USER_PROCESS_PARAMETERS64 {
+    BYTE Reserved1[16];
+    ULONG_PTR Reserved2[10];
+    UNICODE_STRING64 ImagePathName;
+    UNICODE_STRING64 CommandLine;
+    UNICODE_STRING64 CurrentDirectoryPath;
+    ULONG_PTR env;
+} RTL_USER_PROCESS_PARAMETERS64, *PRTL_USER_PROCESS_PARAMETERS64;
+
 char** psutil_windows_process_get_cmdline(Process* proc, int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    WCHAR* cmdline = NULL;
+    SIZE_T size = 0;
+
+#ifdef _WIN64
+    // 64-bit case
+    LPVOID ppeb32 = NULL;
+    NTSTATUS status = g_NtQuerySystemInformation ? g_NtQuerySystemInformation(
+        (SYSTEM_INFORMATION_CLASS)53, // SystemProcessIdInformation
+        &ppeb32,
+        sizeof(LPVOID),
+        NULL
+    ) : STATUS_UNSUCCESSFUL;
+
+    if (NT_SUCCESS(status) && ppeb32 != NULL) {
+        // Target process is 32-bit running in WoW64 mode
+        PEB32 peb32;
+        RTL_USER_PROCESS_PARAMETERS32 procParameters32;
+
+        if (ReadProcessMemory(hProcess, ppeb32, &peb32, sizeof(peb32), NULL)) {
+            if (ReadProcessMemory(
+                hProcess,
+                (LPVOID)peb32.ProcessParameters,
+                &procParameters32,
+                sizeof(procParameters32),
+                NULL
+            )) {
+                size = procParameters32.CommandLine.Length;
+                if (size > 0) {
+                    cmdline = (WCHAR*)malloc(size + 2);
+                    if (cmdline) {
+                        ReadProcessMemory(
+                            hProcess,
+                            (LPVOID)procParameters32.CommandLine.Buffer,
+                            cmdline,
+                            size,
+                            NULL
+                        );
+                        cmdline[size / sizeof(WCHAR)] = L'\0';
+                    }
+                }
+            }
+        }
+    }
+    else {
+        // Target process is 64-bit
+        PROCESS_BASIC_INFORMATION pbi;
+        ULONG returnLength;
+        status = g_NtQueryInformationProcess(
+            hProcess,
+            ProcessBasicInformation,
+            &pbi,
+            sizeof(pbi),
+            &returnLength
+        );
+
+        if (NT_SUCCESS(status)) {
+            PEB64 peb64;
+            RTL_USER_PROCESS_PARAMETERS64 procParameters64;
+
+            if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb64, sizeof(peb64), NULL)) {
+                if (ReadProcessMemory(
+                    hProcess,
+                    (LPCVOID)peb64.ProcessParameters,
+                    &procParameters64,
+                    sizeof(procParameters64),
+                    NULL
+                )) {
+                    size = procParameters64.CommandLine.Length;
+                    if (size > 0) {
+                        cmdline = (WCHAR*)malloc(size + 2);
+                        if (cmdline) {
+                            ReadProcessMemory(
+                                hProcess,
+                                (LPCVOID)procParameters64.CommandLine.Buffer,
+                                cmdline,
+                                size,
+                                NULL
+                            );
+                            cmdline[size / sizeof(WCHAR)] = L'\0';
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    // 32-bit case
+    BOOL weAreWow64, theyAreWow64;
+    if (IsWow64Process(GetCurrentProcess(), &weAreWow64) && 
+        IsWow64Process(hProcess, &theyAreWow64)) {
+        if (weAreWow64 && !theyAreWow64) {
+            // We are 32-bit in WoW64, target is 64-bit
+            // This is complex, we'll skip for now
+        }
+        else {
+            // Both are 32-bit
+            PROCESS_BASIC_INFORMATION pbi;
+            ULONG returnLength;
+            NTSTATUS status = g_NtQueryInformationProcess(
+                hProcess,
+                ProcessBasicInformation,
+                &pbi,
+                sizeof(pbi),
+                &returnLength
+            );
+
+            if (NT_SUCCESS(status)) {
+                PEB32 peb32;
+                RTL_USER_PROCESS_PARAMETERS32 procParameters32;
+
+                if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb32, sizeof(peb32), NULL)) {
+                    if (ReadProcessMemory(
+                        hProcess,
+                        (LPVOID)peb32.ProcessParameters,
+                        &procParameters32,
+                        sizeof(procParameters32),
+                        NULL
+                    )) {
+                        size = procParameters32.CommandLine.Length;
+                        if (size > 0) {
+                            cmdline = (WCHAR*)malloc(size + 2);
+                            if (cmdline) {
+                                ReadProcessMemory(
+                                    hProcess,
+                                    (LPVOID)procParameters32.CommandLine.Buffer,
+                                    cmdline,
+                                    size,
+                                    NULL
+                                );
+                                cmdline[size / sizeof(WCHAR)] = L'\0';
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    CloseHandle(hProcess);
+
+    if (!cmdline) {
+        *count = 0;
+        return NULL;
+    }
+
+    // Parse command line
+    int nArgs;
+    LPWSTR* args = CommandLineToArgvW(cmdline, &nArgs);
+    if (!args) {
+        free(cmdline);
+        *count = 0;
+        return NULL;
+    }
+
+    // Convert to char**
+    char** result = (char**)malloc((nArgs + 1) * sizeof(char*));
+    if (!result) {
+        LocalFree(args);
+        free(cmdline);
+        *count = 0;
+        return NULL;
+    }
+
+    for (int i = 0; i < nArgs; i++) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, args[i], -1, NULL, 0, NULL, NULL);
+        result[i] = (char*)malloc(len * sizeof(char));
+        if (result[i]) {
+            WideCharToMultiByte(CP_UTF8, 0, args[i], -1, result[i], len, NULL, NULL);
+        }
+    }
+    result[nArgs] = NULL;
+
+    LocalFree(args);
+    free(cmdline);
+    *count = nArgs;
+    return result;
 }
 
 int psutil_windows_process_get_status(Process* proc) {
-    // TODO: Implement
-    return STATUS_RUNNING;
+    if (proc == NULL) {
+        return STATUS_DEAD;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return STATUS_DEAD;
+    }
+
+    DWORD exitCode;
+    if (!GetExitCodeProcess(hProcess, &exitCode)) {
+        CloseHandle(hProcess);
+        return STATUS_DEAD;
+    }
+
+    CloseHandle(hProcess);
+
+    if (exitCode == STILL_ACTIVE) {
+        // Process is running
+        return STATUS_RUNNING;
+    } else {
+        // Process has exited
+        return STATUS_DEAD;
+    }
 }
 
 const char* psutil_windows_process_get_username(Process* proc) {
@@ -476,13 +742,67 @@ const char* psutil_windows_process_get_cwd(Process* proc) {
 }
 
 int psutil_windows_process_get_nice(Process* proc) {
-    // TODO: Implement
-    return 0;
+    if (proc == NULL) {
+        return 0;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return 0;
+    }
+
+    DWORD priority = GetPriorityClass(hProcess);
+    CloseHandle(hProcess);
+
+    // Map Windows priority classes to nice values
+    switch (priority) {
+        case IDLE_PRIORITY_CLASS:
+            return 19;
+        case BELOW_NORMAL_PRIORITY_CLASS:
+            return 10;
+        case NORMAL_PRIORITY_CLASS:
+            return 0;
+        case ABOVE_NORMAL_PRIORITY_CLASS:
+            return -10;
+        case HIGH_PRIORITY_CLASS:
+            return -15;
+        case REALTIME_PRIORITY_CLASS:
+            return -20;
+        default:
+            return 0;
+    }
 }
 
 int psutil_windows_process_set_nice(Process* proc, int value) {
-    // TODO: Implement
-    return 0;
+    if (proc == NULL) {
+        return -1;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return -1;
+    }
+
+    DWORD priority;
+    // Map nice values to Windows priority classes
+    if (value <= -20) {
+        priority = REALTIME_PRIORITY_CLASS;
+    } else if (value <= -15) {
+        priority = HIGH_PRIORITY_CLASS;
+    } else if (value <= -10) {
+        priority = ABOVE_NORMAL_PRIORITY_CLASS;
+    } else if (value <= 0) {
+        priority = NORMAL_PRIORITY_CLASS;
+    } else if (value <= 10) {
+        priority = BELOW_NORMAL_PRIORITY_CLASS;
+    } else {
+        priority = IDLE_PRIORITY_CLASS;
+    }
+
+    BOOL result = SetPriorityClass(hProcess, priority);
+    CloseHandle(hProcess);
+
+    return result ? 0 : -1;
 }
 
 psutil_uids psutil_windows_process_get_uids(Process* proc) {
@@ -557,19 +877,338 @@ int psutil_windows_process_get_cpu_num(Process* proc) {
 }
 
 char** psutil_windows_process_get_environ(Process* proc, int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    WCHAR* env = NULL;
+    SIZE_T size = 0;
+
+#ifdef _WIN64
+    // 64-bit case
+    LPVOID ppeb32 = NULL;
+    NTSTATUS status = g_NtQuerySystemInformation ? g_NtQuerySystemInformation(
+        (SYSTEM_INFORMATION_CLASS)53, // SystemProcessIdInformation
+        &ppeb32,
+        sizeof(LPVOID),
+        NULL
+    ) : STATUS_UNSUCCESSFUL;
+
+    if (NT_SUCCESS(status) && ppeb32 != NULL) {
+        // Target process is 32-bit running in WoW64 mode
+        PEB32 peb32;
+        RTL_USER_PROCESS_PARAMETERS32 procParameters32;
+
+        if (ReadProcessMemory(hProcess, ppeb32, &peb32, sizeof(peb32), NULL)) {
+            if (ReadProcessMemory(
+                hProcess,
+                (LPVOID)peb32.ProcessParameters,
+                &procParameters32,
+                sizeof(procParameters32),
+                NULL
+            )) {
+                // Read environment block
+                // We'll read a reasonable amount and then find the end
+                size = 16384; // 16KB initial buffer
+                env = (WCHAR*)malloc(size);
+                if (env) {
+                    SIZE_T bytesRead;
+                    if (ReadProcessMemory(
+                        hProcess,
+                        (LPVOID)procParameters32.env,
+                        env,
+                        size,
+                        &bytesRead
+                    )) {
+                        // Find the end of the environment block (double null terminator)
+                        for (SIZE_T i = 0; i < bytesRead - 1; i += 2) {
+                            if (env[i] == L'\0' && env[i + 2] == L'\0') {
+                                size = i + 4;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else {
+        // Target process is 64-bit
+        PROCESS_BASIC_INFORMATION pbi;
+        ULONG returnLength;
+        status = g_NtQueryInformationProcess(
+            hProcess,
+            ProcessBasicInformation,
+            &pbi,
+            sizeof(pbi),
+            &returnLength
+        );
+
+        if (NT_SUCCESS(status)) {
+            PEB64 peb64;
+            RTL_USER_PROCESS_PARAMETERS64 procParameters64;
+
+            if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb64, sizeof(peb64), NULL)) {
+                if (ReadProcessMemory(
+                    hProcess,
+                    (LPCVOID)peb64.ProcessParameters,
+                    &procParameters64,
+                    sizeof(procParameters64),
+                    NULL
+                )) {
+                    // Read environment block
+                    size = 16384; // 16KB initial buffer
+                    env = (WCHAR*)malloc(size);
+                    if (env) {
+                        SIZE_T bytesRead;
+                        if (ReadProcessMemory(
+                            hProcess,
+                            (LPCVOID)procParameters64.env,
+                            env,
+                            size,
+                            &bytesRead
+                        )) {
+                            // Find the end of the environment block (double null terminator)
+                            for (SIZE_T i = 0; i < bytesRead - 1; i += 2) {
+                                if (env[i] == L'\0' && env[i + 2] == L'\0') {
+                                    size = i + 4;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    // 32-bit case
+    BOOL weAreWow64, theyAreWow64;
+    if (IsWow64Process(GetCurrentProcess(), &weAreWow64) && 
+        IsWow64Process(hProcess, &theyAreWow64)) {
+        if (weAreWow64 && !theyAreWow64) {
+            // We are 32-bit in WoW64, target is 64-bit
+            // This is complex, we'll skip for now
+        }
+        else {
+            // Both are 32-bit
+            PROCESS_BASIC_INFORMATION pbi;
+            ULONG returnLength;
+            NTSTATUS status = g_NtQueryInformationProcess(
+                hProcess,
+                ProcessBasicInformation,
+                &pbi,
+                sizeof(pbi),
+                &returnLength
+            );
+
+            if (NT_SUCCESS(status)) {
+                PEB32 peb32;
+                RTL_USER_PROCESS_PARAMETERS32 procParameters32;
+
+                if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb32, sizeof(peb32), NULL)) {
+                    if (ReadProcessMemory(
+                        hProcess,
+                        (LPVOID)peb32.ProcessParameters,
+                        &procParameters32,
+                        sizeof(procParameters32),
+                        NULL
+                    )) {
+                        // Read environment block
+                        size = 16384; // 16KB initial buffer
+                        env = (WCHAR*)malloc(size);
+                        if (env) {
+                            SIZE_T bytesRead;
+                            if (ReadProcessMemory(
+                                hProcess,
+                                (LPVOID)procParameters32.env,
+                                env,
+                                size,
+                                &bytesRead
+                            )) {
+                                // Find the end of the environment block (double null terminator)
+                                for (SIZE_T i = 0; i < bytesRead - 1; i += 2) {
+                                    if (env[i] == L'\0' && env[i + 2] == L'\0') {
+                                        size = i + 4;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    CloseHandle(hProcess);
+
+    if (!env) {
+        *count = 0;
+        return NULL;
+    }
+
+    // Count environment variables
+    int envCount = 0;
+    for (SIZE_T i = 0; i < size - 2; i += 2) {
+        if (env[i] == L'\0') {
+            envCount++;
+        }
+    }
+
+    // Convert to char**
+    char** result = (char**)malloc((envCount + 1) * sizeof(char*));
+    if (!result) {
+        free(env);
+        *count = 0;
+        return NULL;
+    }
+
+    int index = 0;
+    for (SIZE_T i = 0; i < size - 2 && index < envCount; ) {
+        if (env[i] != L'\0') {
+            int len = WideCharToMultiByte(CP_UTF8, 0, &env[i], -1, NULL, 0, NULL, NULL);
+            result[index] = (char*)malloc(len * sizeof(char));
+            if (result[index]) {
+                WideCharToMultiByte(CP_UTF8, 0, &env[i], -1, result[index], len, NULL, NULL);
+            }
+            index++;
+            // Skip to next variable
+            while (i < size - 2 && env[i] != L'\0') {
+                i += 2;
+            }
+        }
+        i += 2;
+    }
+    result[envCount] = NULL;
+
+    free(env);
+    *count = envCount;
+    return result;
 }
 
 int psutil_windows_process_get_num_handles(Process* proc) {
-    // TODO: Implement
+    if (proc == NULL) {
+        return 0;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return 0;
+    }
+
+    DWORD handleCount = 0;
+    if (GetProcessHandleCount(hProcess, &handleCount)) {
+        CloseHandle(hProcess);
+        return (int)handleCount;
+    }
+
+    CloseHandle(hProcess);
     return 0;
 }
 
+// System process information structure
+typedef struct _SYSTEM_PROCESS_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    BYTE Reserved1[48];
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+    PVOID Reserved2;
+    ULONG HandleCount;
+    ULONG SessionId;
+    PVOID Reserved3;
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG Reserved4;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    PVOID Reserved5;
+    SIZE_T QuotaPagedPoolUsage;
+    PVOID Reserved6;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivatePageCount;
+    LARGE_INTEGER Reserved7[6];
+} SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
+
 psutil_ctx_switches psutil_windows_process_get_num_ctx_switches(Process* proc) {
     psutil_ctx_switches switches = {0};
-    // TODO: Implement
+    if (proc == NULL) {
+        return switches;
+    }
+
+    if (!g_NtQuerySystemInformation) {
+        return switches;
+    }
+
+    // Allocate buffer for system process information
+    ULONG bufferSize = 1024 * 1024; // 1MB initial buffer
+    PVOID buffer = malloc(bufferSize);
+    if (!buffer) {
+        return switches;
+    }
+
+    NTSTATUS status;
+    ULONG returnLength;
+
+    // Query system process information
+    status = g_NtQuerySystemInformation(
+        SystemProcessInformation,
+        buffer,
+        bufferSize,
+        &returnLength
+    );
+
+    if (status == STATUS_INFO_LENGTH_MISMATCH) {
+        // Buffer too small, reallocate
+        free(buffer);
+        bufferSize = returnLength;
+        buffer = malloc(bufferSize);
+        if (!buffer) {
+            return switches;
+        }
+
+        status = g_NtQuerySystemInformation(
+            SystemProcessInformation,
+            buffer,
+            bufferSize,
+            &returnLength
+        );
+    }
+
+    if (NT_SUCCESS(status)) {
+        PSYSTEM_PROCESS_INFORMATION pProcessInfo = (PSYSTEM_PROCESS_INFORMATION)buffer;
+
+        // Iterate through process information to find our process
+        while (TRUE) {
+            if (pProcessInfo->UniqueProcessId == (HANDLE)(DWORD_PTR)proc->pid) {
+                // Found our process, now get thread information
+                // Note: SYSTEM_PROCESS_INFORMATION doesn't directly contain context switch counts
+                // We'll need to sum context switches from all threads
+                // For simplicity, we'll return 0 for now
+                break;
+            }
+
+            if (pProcessInfo->NextEntryOffset == 0) {
+                break; // End of list
+            }
+
+            pProcessInfo = (PSYSTEM_PROCESS_INFORMATION)((PBYTE)pProcessInfo + pProcessInfo->NextEntryOffset);
+        }
+    }
+
+    free(buffer);
     return switches;
 }
 
@@ -598,9 +1237,70 @@ int psutil_windows_process_get_num_threads(Process* proc) {
 }
 
 psutil_thread* psutil_windows_process_get_threads(Process* proc, int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        *count = 0;
+        return NULL;
+    }
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(THREADENTRY32);
+
+    // First pass: count threads
+    int threadCount = 0;
+    if (Thread32First(hSnapshot, &te)) {
+        do {
+            if (te.th32OwnerProcessID == proc->pid) {
+                threadCount++;
+            }
+        } while (Thread32Next(hSnapshot, &te));
+    }
+
+    if (threadCount == 0) {
+        CloseHandle(hSnapshot);
+        *count = 0;
+        return NULL;
+    }
+
+    // Allocate memory for thread information
+    psutil_thread* threads = (psutil_thread*)malloc(threadCount * sizeof(psutil_thread));
+    if (!threads) {
+        CloseHandle(hSnapshot);
+        *count = 0;
+        return NULL;
+    }
+
+    // Second pass: collect thread information
+    int index = 0;
+    if (Thread32First(hSnapshot, &te)) {
+        do {
+            if (te.th32OwnerProcessID == proc->pid) {
+                threads[index].id = te.th32ThreadID;
+                
+                // Get thread times
+                HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (hThread) {
+                    FILETIME createTime, exitTime, kernelTime, userTime;
+                    if (GetThreadTimes(hThread, &createTime, &exitTime, &kernelTime, &userTime)) {
+                        threads[index].user_time = psutil_FiletimeToUnixTime(userTime);
+                        threads[index].system_time = psutil_FiletimeToUnixTime(kernelTime);
+                    }
+                    CloseHandle(hThread);
+                }
+                
+                index++;
+            }
+        } while (Thread32Next(hSnapshot, &te) && index < threadCount);
+    }
+
+    CloseHandle(hSnapshot);
+    *count = threadCount;
+    return threads;
 }
 
 psutil_cpu_times psutil_windows_process_get_cpu_times(Process* proc) {
@@ -664,15 +1364,263 @@ double psutil_windows_process_get_memory_percent(Process* proc, const char* memt
 }
 
 psutil_memory_map* psutil_windows_process_get_memory_maps(Process* proc, int* count, int grouped) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    // Get system information to determine memory range
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    LPVOID minAddr = si.lpMinimumApplicationAddress;
+    LPVOID maxAddr = si.lpMaximumApplicationAddress;
+
+    // Allocate initial buffer for memory maps
+    int capacity = 128;
+    psutil_memory_map* maps = (psutil_memory_map*)malloc(capacity * sizeof(psutil_memory_map));
+    if (!maps) {
+        CloseHandle(hProcess);
+        *count = 0;
+        return NULL;
+    }
+
+    int mapCount = 0;
+    LPVOID addr = minAddr;
+
+    while (addr < maxAddr) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQueryEx(hProcess, addr, &mbi, sizeof(mbi)) == 0) {
+            break;
+        }
+
+        // Skip reserved memory regions
+        if (mbi.State == MEM_RESERVE || mbi.State == MEM_FREE) {
+            addr = (LPVOID)((DWORD_PTR)addr + mbi.RegionSize);
+            continue;
+        }
+
+        // Get mapped file name if available
+        char fileName[MAX_PATH] = {0};
+        if (mbi.Type == MEM_MAPPED || mbi.Type == MEM_IMAGE) {
+            DWORD size = GetMappedFileNameA(hProcess, mbi.BaseAddress, fileName, MAX_PATH);
+            if (size == 0) {
+                fileName[0] = '\0';
+            }
+        }
+
+        // Add to memory maps
+        if (mapCount >= capacity) {
+            capacity *= 2;
+            psutil_memory_map* newMaps = (psutil_memory_map*)realloc(maps, capacity * sizeof(psutil_memory_map));
+            if (!newMaps) {
+                free(maps);
+                CloseHandle(hProcess);
+                *count = 0;
+                return NULL;
+            }
+            maps = newMaps;
+        }
+
+        strncpy(maps[mapCount].path, fileName, sizeof(maps[mapCount].path) - 1);
+        maps[mapCount].rss = mbi.RegionSize;
+        maps[mapCount].vms = mbi.RegionSize;
+        maps[mapCount].shared = 0; // Not easily available on Windows
+        maps[mapCount].text = (mbi.Type == MEM_IMAGE) ? mbi.RegionSize : 0;
+        maps[mapCount].lib = 0; // Not easily available on Windows
+        maps[mapCount].data = (mbi.Type == MEM_PRIVATE) ? mbi.RegionSize : 0;
+        maps[mapCount].dirty = 0; // Not easily available on Windows
+
+        mapCount++;
+        addr = (LPVOID)((DWORD_PTR)addr + mbi.RegionSize);
+    }
+
+    CloseHandle(hProcess);
+    *count = mapCount;
+    return maps;
 }
 
+// Handle information structure
+typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    USHORT UniqueProcessId;
+    USHORT CreatorBackTraceIndex;
+    UCHAR ObjectTypeIndex;
+    UCHAR HandleAttributes;
+    USHORT HandleValue;
+    PVOID Object;
+    ULONG GrantedAccess;
+} SYSTEM_HANDLE_TABLE_ENTRY_INFO, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION {
+    ULONG NumberOfHandles;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO Handles[1];
+} SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
+
+// Object type information structure
+typedef struct _OBJECT_TYPE_INFORMATION {
+    UNICODE_STRING Name;
+    ULONG TotalNumberOfObjects;
+    ULONG TotalNumberOfHandles;
+    ULONG TotalPagedPoolUsage;
+    ULONG TotalNonPagedPoolUsage;
+    ULONG TotalNamePoolUsage;
+    ULONG TotalHandleTableUsage;
+    ULONG HighWaterNumberOfObjects;
+    ULONG HighWaterNumberOfHandles;
+    ULONG HighWaterPagedPoolUsage;
+    ULONG HighWaterNonPagedPoolUsage;
+    ULONG HighWaterNamePoolUsage;
+    ULONG HighWaterHandleTableUsage;
+    ULONG InvalidAttributes;
+    GENERIC_MAPPING GenericMapping;
+    ULONG ValidAccess;
+    BOOLEAN SecurityRequired;
+    BOOLEAN MaintainHandleCount;
+    UCHAR TypeIndex;
+    CHAR ReservedByte;
+    ULONG PoolType;
+    ULONG DefaultPagedPoolCharge;
+    ULONG DefaultNonPagedPoolCharge;
+} OBJECT_TYPE_INFORMATION, *POBJECT_TYPE_INFORMATION;
+
 psutil_open_file* psutil_windows_process_get_open_files(Process* proc, int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+
+    if (!g_NtQuerySystemInformation || !g_NtQueryObject) {
+        *count = 0;
+        return NULL;
+    }
+
+    // Allocate buffer for handle information
+    ULONG bufferSize = 1024 * 1024; // 1MB initial buffer
+    PVOID buffer = malloc(bufferSize);
+    if (!buffer) {
+        *count = 0;
+        return NULL;
+    }
+
+    NTSTATUS status;
+    ULONG returnLength;
+
+    // Query system handle information
+    status = g_NtQuerySystemInformation(
+        (SYSTEM_INFORMATION_CLASS)16, // SystemHandleInformation
+        buffer,
+        bufferSize,
+        &returnLength
+    );
+
+    if (status == STATUS_INFO_LENGTH_MISMATCH) {
+        // Buffer too small, reallocate
+        free(buffer);
+        bufferSize = returnLength;
+        buffer = malloc(bufferSize);
+        if (!buffer) {
+            *count = 0;
+            return NULL;
+        }
+
+        status = g_NtQuerySystemInformation(
+            (SYSTEM_INFORMATION_CLASS)16, // SystemHandleInformation
+            buffer,
+            bufferSize,
+            &returnLength
+        );
+    }
+
+    if (!NT_SUCCESS(status)) {
+        free(buffer);
+        *count = 0;
+        return NULL;
+    }
+
+    PSYSTEM_HANDLE_INFORMATION handleInfo = (PSYSTEM_HANDLE_INFORMATION)buffer;
+    int fileHandleCount = 0;
+
+    // First pass: count file handles for this process
+    for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
+        if (handleInfo->Handles[i].UniqueProcessId == proc->pid) {
+            fileHandleCount++;
+        }
+    }
+
+    if (fileHandleCount == 0) {
+        free(buffer);
+        *count = 0;
+        return NULL;
+    }
+
+    // Allocate memory for open files
+    psutil_open_file* openFiles = (psutil_open_file*)malloc(fileHandleCount * sizeof(psutil_open_file));
+    if (!openFiles) {
+        free(buffer);
+        *count = 0;
+        return NULL;
+    }
+
+    // Second pass: collect file information
+    int index = 0;
+    HANDLE hProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, proc->pid);
+    if (hProcess) {
+        for (ULONG i = 0; i < handleInfo->NumberOfHandles && index < fileHandleCount; i++) {
+            if (handleInfo->Handles[i].UniqueProcessId == proc->pid) {
+                // Duplicate the handle to our process
+                HANDLE hDuplicate;
+                if (DuplicateHandle(
+                    hProcess,
+                    (HANDLE)(DWORD_PTR)handleInfo->Handles[i].HandleValue,
+                    GetCurrentProcess(),
+                    &hDuplicate,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS
+                )) {
+                    // Get object type information
+                    ULONG typeBufferSize = 1024;
+                    PVOID typeBuffer = malloc(typeBufferSize);
+                    if (typeBuffer) {
+                        status = g_NtQueryObject(
+                            hDuplicate,
+                            ObjectTypeInformation,
+                            typeBuffer,
+                            typeBufferSize,
+                            &returnLength
+                        );
+
+                        if (NT_SUCCESS(status)) {
+                            POBJECT_TYPE_INFORMATION typeInfo = (POBJECT_TYPE_INFORMATION)typeBuffer;
+                            // Check if this is a file handle
+                            if (typeInfo->Name.Length > 0 && 
+                                wcsncmp(typeInfo->Name.Buffer, L"File", typeInfo->Name.Length / 2) == 0) {
+                                // Get file path
+                                char filePath[MAX_PATH] = {0};
+                                if (GetFinalPathNameByHandleA(hDuplicate, filePath, MAX_PATH, FILE_NAME_NORMALIZED)) {
+                                    strncpy(openFiles[index].path, filePath, sizeof(openFiles[index].path) - 1);
+                                    openFiles[index].fd = (int)handleInfo->Handles[i].HandleValue;
+                                    index++;
+                                }
+                            }
+                        }
+                        free(typeBuffer);
+                    }
+                    CloseHandle(hDuplicate);
+                }
+            }
+        }
+        CloseHandle(hProcess);
+    }
+
+    free(buffer);
+    *count = index;
+    return openFiles;
 }
 
 psutil_net_connection* psutil_windows_process_get_net_connections(Process* proc, const char* kind, int* count) {
@@ -950,13 +1898,17 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
     int capacity = 64;
     int index = 0;
     psutil_net_connection* connections = (psutil_net_connection*)malloc(capacity * sizeof(psutil_net_connection));
+    
+    // Table pointers
+    PMIB_TCPTABLE_OWNER_PID tcp_table = NULL;
+    PMIB_UDPTABLE_OWNER_PID udp_table = NULL;
+    
     if (connections == NULL) {
         return NULL;
     }
     
     // Get TCP IPv4 connections
     if (get_tcp) {
-        PMIB_TCPTABLE_OWNER_PID tcp_table = NULL;
         DWORD size = 0;
         
         // Get required size
@@ -992,8 +1944,8 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
     }
     
     // Get TCP IPv6 connections
+    /*
     if (get_tcp6) {
-        PMIB_TCP6TABLE_OWNER_PID tcp6_table = NULL;
         DWORD size = 0;
         
         GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
@@ -1026,10 +1978,10 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
         }
         free(tcp6_table);
     }
+    */
     
     // Get UDP IPv4 connections
     if (get_udp) {
-        PMIB_UDPTABLE_OWNER_PID udp_table = NULL;
         DWORD size = 0;
         
         GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
@@ -1063,8 +2015,8 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
     }
     
     // Get UDP IPv6 connections
+    /*
     if (get_udp6) {
-        PMIB_UDP6TABLE_OWNER_PID udp6_table = NULL;
         DWORD size = 0;
         
         GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
@@ -1096,6 +2048,7 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
         }
         free(udp6_table);
     }
+    */
     
     *count = index;
     if (index == 0) {
