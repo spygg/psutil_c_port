@@ -2,6 +2,9 @@
 
 This is the C implementation of psutil, a cross-platform library for retrieving information on running processes and system utilization. This project is ported from the original psutil Python library and completed with the assistance of AI.
 
+## Chinese Version
+[中文版](README.md)
+
 ## Project Origin
 
 This C library is a port of the [psutil](https://github.com/giampaolo/psutil) Python library, which was created by Giampaolo Rodola'. The C implementation aims to provide the same functionality as the original Python version but with the performance benefits of C.
@@ -84,10 +87,10 @@ The development of this C library was accelerated using AI assistance, which hel
 - [ ] Optimize performance for large process lists
 
 ### macOS Platform
-- ✅ All tasks completed
+- [ ] Compile and test
 
 ### BSD Platform
-- [ ] Implement process environment variables
+- [ ] Compile and test
 
 ## Build Instructions
 
@@ -163,6 +166,3 @@ This project is licensed under the BSD License. See the LICENSE file for details
 
 ---
 
-## Chinese Version
-
-[Click here to view the Chinese version](README.md)

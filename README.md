@@ -2,6 +2,10 @@
 
 这是 psutil 的 C 语言实现，一个跨平台库，用于检索运行进程和系统利用率的信息。该项目从原始的 psutil Python 库移植而来，并在 AI 的协助下完成。
 
+## English Version
+[Click here to view the English version](README_EN.md)
+
+
 ## 项目来源
 
 这个 C 库是 [psutil](https://github.com/giampaolo/psutil) Python 库的移植版本，原始库由 Giampaolo Rodola' 创建。C 实现旨在提供与原始 Python 版本相同的功能，但具有 C 语言的性能优势。
@@ -84,10 +88,10 @@
 - [ ] 优化大进程列表的性能
 
 ### macOS 平台
-- ✅ 已完成所有任务
+- [ ] 编译和测试
 
 ### BSD 平台
-- [ ] 完善进程环境变量实现
+- [ ] 编译和测试
 
 ## 构建说明
 
@@ -162,7 +166,3 @@ int main() {
 本项目使用 BSD 许可证。详见 LICENSE 文件。
 
 ---
-
-## English Version
-
-[Click here to view the English version](README_EN.md)
