@@ -17,9 +17,11 @@ add_executable(example example.c)
 target_include_directories(example PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(example psutil)
 
-# Link pthread library for Linux
+# Link necessary libraries for Linux
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
     target_link_libraries(example pthread)
+    # Link rt library for CPU affinity functions
+    target_link_libraries(example rt)
 endif()
 
 # Installation

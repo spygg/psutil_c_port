@@ -11,12 +11,17 @@
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <signal.h>
 #include <utmp.h>
 #include <sched.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 #include "../../psutil.h"
 #include "psutil_linux.h"
 
@@ -563,14 +568,88 @@ int psutil_linux_process_set_ionice(Process* proc, int ioclass, int value) {
 }
 
 int* psutil_linux_process_get_cpu_affinity(Process* proc, int* count) {
-    // TODO: Implement CPU affinity
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Get the number of online CPUs
+    int cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count <= 0) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Allocate memory for CPU mask
+    size_t mask_size = (cpu_count + 7) / 8;
+    unsigned char* mask = (unsigned char*)calloc(mask_size, 1);
+    if (mask == NULL) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Get CPU affinity
+    if (sched_getaffinity(proc->pid, mask_size, mask) != 0) {
+        free(mask);
+        *count = 0;
+        return NULL;
+    }
+    
+    // Allocate memory for CPU list
+    int* cpus = (int*)malloc(cpu_count * sizeof(int));
+    if (cpus == NULL) {
+        free(mask);
+        *count = 0;
+        return NULL;
+    }
+    
+    // Build CPU list from mask
+    int index = 0;
+    for (int i = 0; i < cpu_count; i++) {
+        int byte_index = i / 8;
+        int bit_index = i % 8;
+        if (mask[byte_index] & (1 << bit_index)) {
+            cpus[index++] = i;
+        }
+    }
+    
+    free(mask);
+    *count = index;
+    return cpus;
 }
 
 int psutil_linux_process_set_cpu_affinity(Process* proc, int* cpus, int count) {
-    // TODO: Implement CPU affinity
-    return -1;
+    if (proc == NULL || cpus == NULL || count <= 0) {
+        return -1;
+    }
+    
+    // Get the number of online CPUs
+    int cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count <= 0) {
+        return -1;
+    }
+    
+    // Allocate memory for CPU mask
+    size_t mask_size = (cpu_count + 7) / 8;
+    unsigned char* mask = (unsigned char*)calloc(mask_size, 1);
+    if (mask == NULL) {
+        return -1;
+    }
+    
+    // Build mask from CPU list
+    for (int i = 0; i < count; i++) {
+        int cpu = cpus[i];
+        if (cpu >= 0 && cpu < cpu_count) {
+            int byte_index = cpu / 8;
+            int bit_index = cpu % 8;
+            mask[byte_index] |= (1 << bit_index);
+        }
+    }
+    
+    // Set CPU affinity
+    int result = sched_setaffinity(proc->pid, mask_size, mask) == 0 ? 0 : -1;
+    free(mask);
+    return result;
 }
 
 int psutil_linux_process_get_cpu_num(Process* proc) {
@@ -879,15 +958,213 @@ double psutil_linux_process_get_memory_percent(Process* proc, const char* memtyp
 }
 
 psutil_memory_map* psutil_linux_process_get_memory_maps(Process* proc, int* count, int grouped) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+    
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/smaps", proc->pid);
+    FILE* fp = fopen(path, "r");
+    if (fp == NULL) {
+        *count = 0;
+        return NULL;
+    }
+    
+    int capacity = 64;
+    psutil_memory_map* maps = (psutil_memory_map*)malloc(capacity * sizeof(psutil_memory_map));
+    if (maps == NULL) {
+        fclose(fp);
+        *count = 0;
+        return NULL;
+    }
+    
+    int index = 0;
+    char line[1024];
+    psutil_memory_map current = {0};
+    
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        // Check if this is a header line (starts with hex address)
+        if (line[0] >= '0' && line[0] <= '9' || line[0] >= 'a' && line[0] <= 'f') {
+            // Save previous entry if we have one
+            if (index > 0 && current.path[0] != '\0') {
+                if (index >= capacity) {
+                    capacity *= 2;
+                    psutil_memory_map* new_maps = (psutil_memory_map*)realloc(maps, capacity * sizeof(psutil_memory_map));
+                    if (new_maps == NULL) {
+                        free(maps);
+                        fclose(fp);
+                        *count = 0;
+                        return NULL;
+                    }
+                    maps = new_maps;
+                }
+                maps[index] = current;
+                index++;
+            }
+            
+            // Parse header line
+            // Format: address perms offset dev inode pathname
+            memset(&current, 0, sizeof(current));
+            char perms[5] = {0};
+            unsigned long offset;
+            unsigned int dev_major, dev_minor;
+            unsigned long inode;
+            char* pathname = NULL;
+            
+            // Find the pathname (after the 5th field)
+            char* p = line;
+            int field = 0;
+            while (*p && field < 5) {
+                if (*p == ' ') {
+                    field++;
+                    while (*p == ' ') p++;
+                } else {
+                    p++;
+                }
+            }
+            
+            if (*p) {
+                pathname = p;
+                // Remove newline
+                while (*pathname && *pathname != '\n') pathname++;
+                *pathname = '\0';
+                pathname = p;
+            }
+            
+            // Parse the line
+            if (sscanf(line, "%*s %4s %lx %x:%x %lu", perms, &offset, &dev_major, &dev_minor, &inode) >= 5) {
+                if (pathname && *pathname) {
+                    strncpy(current.path, pathname, sizeof(current.path) - 1);
+                } else {
+                    strncpy(current.path, "[anon]", sizeof(current.path) - 1);
+                }
+            }
+        } else {
+            // Parse detail lines
+            if (strncmp(line, "Rss:", 4) == 0) {
+                unsigned long value;
+                if (sscanf(line, "Rss: %lu", &value) == 1) {
+                    current.rss = value * 1024;
+                }
+            } else if (strncmp(line, "Size:", 5) == 0) {
+                unsigned long value;
+                if (sscanf(line, "Size: %lu", &value) == 1) {
+                    current.vms = value * 1024;
+                }
+            } else if (strncmp(line, "Shared_Clean:", 13) == 0) {
+                unsigned long value;
+                if (sscanf(line, "Shared_Clean: %lu", &value) == 1) {
+                    current.shared += value * 1024;
+                }
+            } else if (strncmp(line, "Shared_Dirty:", 13) == 0) {
+                unsigned long value;
+                if (sscanf(line, "Shared_Dirty: %lu", &value) == 1) {
+                    current.shared += value * 1024;
+                }
+            } else if (strncmp(line, "Private_Clean:", 14) == 0) {
+                unsigned long value;
+                if (sscanf(line, "Private_Clean: %lu", &value) == 1) {
+                    current.dirty += value * 1024;
+                }
+            } else if (strncmp(line, "Private_Dirty:", 14) == 0) {
+                unsigned long value;
+                if (sscanf(line, "Private_Dirty: %lu", &value) == 1) {
+                    current.dirty += value * 1024;
+                }
+            }
+        }
+    }
+    
+    // Save last entry
+    if (current.path[0] != '\0') {
+        if (index >= capacity) {
+            capacity *= 2;
+            psutil_memory_map* new_maps = (psutil_memory_map*)realloc(maps, capacity * sizeof(psutil_memory_map));
+            if (new_maps == NULL) {
+                free(maps);
+                fclose(fp);
+                *count = 0;
+                return NULL;
+            }
+            maps = new_maps;
+        }
+        maps[index] = current;
+        index++;
+    }
+    
+    fclose(fp);
+    *count = index;
+    return maps;
 }
 
 psutil_open_file* psutil_linux_process_get_open_files(Process* proc, int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        *count = 0;
+        return NULL;
+    }
+    
+    char fd_path[256];
+    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", proc->pid);
+    
+    DIR* dir = opendir(fd_path);
+    if (dir == NULL) {
+        *count = 0;
+        return NULL;
+    }
+    
+    int capacity = 64;
+    psutil_open_file* files = (psutil_open_file*)malloc(capacity * sizeof(psutil_open_file));
+    if (files == NULL) {
+        closedir(dir);
+        *count = 0;
+        return NULL;
+    }
+    
+    int index = 0;
+    struct dirent* entry;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip . and ..
+        if (entry->d_name[0] == '.') continue;
+        
+        char fd_link[512];
+        snprintf(fd_link, sizeof(fd_link), "%s/%s", fd_path, entry->d_name);
+        
+        char file_path[1024];
+        ssize_t len = readlink(fd_link, file_path, sizeof(file_path) - 1);
+        if (len == -1) continue;
+        
+        file_path[len] = '\0';
+        
+        // Only include regular files (paths starting with /)
+        if (file_path[0] != '/') continue;
+        
+        // Check if file exists
+        struct stat st;
+        if (stat(file_path, &st) != 0) continue;
+        if (!S_ISREG(st.st_mode)) continue;
+        
+        if (index >= capacity) {
+            capacity *= 2;
+            psutil_open_file* new_files = (psutil_open_file*)realloc(files, capacity * sizeof(psutil_open_file));
+            if (new_files == NULL) {
+                free(files);
+                closedir(dir);
+                *count = 0;
+                return NULL;
+            }
+            files = new_files;
+        }
+        
+        strncpy(files[index].path, file_path, sizeof(files[index].path) - 1);
+        files[index].fd = atoi(entry->d_name);
+        index++;
+    }
+    
+    closedir(dir);
+    *count = index;
+    return files;
 }
 
 psutil_net_connection* psutil_linux_process_get_net_connections(Process* proc, const char* kind, int* count) {
@@ -1395,15 +1672,188 @@ psutil_net_connection* psutil_linux_net_connections(const char* kind, int* count
 }
 
 psutil_net_if_addr* psutil_linux_net_if_addrs(int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    struct ifaddrs *ifaddr, *ifa;
+    
+    if (getifaddrs(&ifaddr) == -1) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Count interfaces
+    int capacity = 0;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr != NULL) {
+            capacity++;
+        }
+    }
+    
+    if (capacity == 0) {
+        freeifaddrs(ifaddr);
+        *count = 0;
+        return NULL;
+    }
+    
+    psutil_net_if_addr* addrs = (psutil_net_if_addr*)malloc(capacity * sizeof(psutil_net_if_addr));
+    if (addrs == NULL) {
+        freeifaddrs(ifaddr);
+        *count = 0;
+        return NULL;
+    }
+    
+    int index = 0;
+    for (ifa = ifaddr; ifa != NULL && index < capacity; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+        
+        int family = ifa->ifa_addr->sa_family;
+        
+        // Clear the entry
+        memset(&addrs[index], 0, sizeof(psutil_net_if_addr));
+        
+        // Set interface name
+        strncpy(addrs[index].name, ifa->ifa_name, sizeof(addrs[index].name) - 1);
+        
+        // Convert address
+        if (family == AF_INET) {
+            struct sockaddr_in* addr = (struct sockaddr_in*)ifa->ifa_addr;
+            inet_ntop(AF_INET, &addr->sin_addr, addrs[index].address, sizeof(addrs[index].address));
+            
+            if (ifa->ifa_netmask != NULL) {
+                struct sockaddr_in* netmask = (struct sockaddr_in*)ifa->ifa_netmask;
+                inet_ntop(AF_INET, &netmask->sin_addr, addrs[index].netmask, sizeof(addrs[index].netmask));
+            }
+            
+            if (ifa->ifa_flags & IFF_BROADCAST && ifa->ifa_broadaddr != NULL) {
+                struct sockaddr_in* broadcast = (struct sockaddr_in*)ifa->ifa_broadaddr;
+                inet_ntop(AF_INET, &broadcast->sin_addr, addrs[index].broadcast, sizeof(addrs[index].broadcast));
+            }
+            index++;
+        } else if (family == AF_INET6) {
+            struct sockaddr_in6* addr = (struct sockaddr_in6*)ifa->ifa_addr;
+            inet_ntop(AF_INET6, &addr->sin6_addr, addrs[index].address, sizeof(addrs[index].address));
+            
+            if (ifa->ifa_netmask != NULL) {
+                struct sockaddr_in6* netmask = (struct sockaddr_in6*)ifa->ifa_netmask;
+                inet_ntop(AF_INET6, &netmask->sin6_addr, addrs[index].netmask, sizeof(addrs[index].netmask));
+            }
+            index++;
+        }
+    }
+    
+    freeifaddrs(ifaddr);
+    *count = index;
+    return addrs;
 }
 
 psutil_net_if_stat* psutil_linux_net_if_stats(int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    // Get list of interfaces from net_io_counters
+    psutil_io_counters* io_counters = NULL;
+    int io_count = 0;
+    
+    // First, get list of interface names from /proc/net/dev
+    FILE* fp = fopen("/proc/net/dev", "r");
+    if (fp == NULL) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Count interfaces (skip first 2 header lines)
+    int capacity = 0;
+    char line[512];
+    fgets(line, sizeof(line), fp);  // Skip header
+    fgets(line, sizeof(line), fp);  // Skip header
+    
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        capacity++;
+    }
+    
+    if (capacity == 0) {
+        fclose(fp);
+        *count = 0;
+        return NULL;
+    }
+    
+    psutil_net_if_stat* stats = (psutil_net_if_stat*)malloc(capacity * sizeof(psutil_net_if_stat));
+    if (stats == NULL) {
+        fclose(fp);
+        *count = 0;
+        return NULL;
+    }
+    
+    // Reset file pointer
+    rewind(fp);
+    fgets(line, sizeof(line), fp);  // Skip header
+    fgets(line, sizeof(line), fp);  // Skip header
+    
+    int index = 0;
+    while (fgets(line, sizeof(line), fp) != NULL && index < capacity) {
+        // Parse interface name
+        char* colon = strchr(line, ':');
+        if (colon == NULL) continue;
+        
+        *colon = '\0';
+        char* name = line;
+        // Skip leading whitespace
+        while (*name == ' ') name++;
+        
+        // Get interface stats using ioctl
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
+        
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+        
+        // Initialize the entry
+        memset(&stats[index], 0, sizeof(psutil_net_if_stat));
+        strncpy(stats[index].name, name, sizeof(stats[index].name) - 1);
+        
+        // Get flags
+        if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0) {
+            stats[index].isup = (ifr.ifr_flags & IFF_UP) ? 1 : 0;
+        }
+        
+        // Get MTU
+        if (ioctl(sock, SIOCGIFMTU, &ifr) == 0) {
+            stats[index].mtu = ifr.ifr_mtu;
+        }
+        
+        // Get speed and duplex from /sys/class/net/<name>/
+        char speed_path[256];
+        snprintf(speed_path, sizeof(speed_path), "/sys/class/net/%s/speed", name);
+        FILE* speed_fp = fopen(speed_path, "r");
+        if (speed_fp != NULL) {
+            int speed;
+            if (fscanf(speed_fp, "%d", &speed) == 1) {
+                stats[index].speed = speed;
+            }
+            fclose(speed_fp);
+        }
+        
+        // Duplex - default to unknown
+        stats[index].duplex = 0;  // DUPLEX_UNKNOWN
+        
+        char duplex_path[256];
+        snprintf(duplex_path, sizeof(duplex_path), "/sys/class/net/%s/duplex", name);
+        FILE* duplex_fp = fopen(duplex_path, "r");
+        if (duplex_fp != NULL) {
+            char duplex[32];
+            if (fscanf(duplex_fp, "%s", duplex) == 1) {
+                if (strcmp(duplex, "full") == 0) {
+                    stats[index].duplex = 2;  // DUPLEX_FULL
+                } else if (strcmp(duplex, "half") == 0) {
+                    stats[index].duplex = 1;  // DUPLEX_HALF
+                }
+            }
+            fclose(duplex_fp);
+        }
+        
+        close(sock);
+        index++;
+    }
+    
+    fclose(fp);
+    *count = index;
+    return stats;
 }
 
 psutil_io_counters psutil_linux_disk_io_counters(int perdisk) {

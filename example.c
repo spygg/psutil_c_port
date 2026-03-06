@@ -175,9 +175,15 @@ int main() {
         printf("Logged in users:\n");
         for (int i = 0; i < user_count; i++) {
             double start_time = users_list[i].started;
-            printf("  User: %s, Terminal: %s, Login time: %s", 
-                   users_list[i].name, users_list[i].terminal, 
-                   ctime((time_t*)&start_time));
+            if (start_time > 0.0) {
+                time_t t = (time_t)start_time;
+                printf("  User: %s, Terminal: %s, Login time: %s", 
+                       users_list[i].name, users_list[i].terminal, 
+                       ctime(&t));
+            } else {
+                printf("  User: %s, Terminal: %s, Login time: (null)\n", 
+                       users_list[i].name, users_list[i].terminal);
+            }
         }
         free(users_list);
     }

@@ -83,6 +83,8 @@ typedef enum _MEMORY_INFORMATION_CLASS {
 // WTS definitions - use system headers from wtsapi32.h
 
 // Windows version constants
+#define PSUTIL_WINDOWS_XP 51
+#define PSUTIL_WINDOWS_SERVER_2003 52
 #define PSUTIL_WINDOWS_VISTA 60
 #define PSUTIL_WINDOWS_7 61
 #define PSUTIL_WINDOWS_8 62
