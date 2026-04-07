@@ -29,9 +29,11 @@
 │   └── arch/            # 平台特定实现
 │       ├── windows/      # Windows 实现
 │       ├── linux/        # Linux 实现
+│       ├── android/      # Android 实现
 │       ├── macos/        # macOS 实现
 │       └── bsd/          # BSD 实现
 ├── example.c            # 使用示例
+├── example.py           # Python 使用示例
 ├── CMakeLists.txt       # 主 CMake 配置
 ├── README.md            # 中文版本
 └── README_EN.md         # 英文版本
@@ -69,6 +71,16 @@
 - ✅ 系统启动时间和运行时间
 - ✅ 网络接口地址
 
+### Android 平台
+- ✅ 进程信息（名称、可执行文件、命令行、状态等）
+- ✅ 进程内存和 CPU 使用情况
+- ✅ 系统内存和 CPU 信息
+- ✅ 磁盘分区和使用情况
+- ✅ 网络连接和 IO 统计
+- ✅ 进程控制（挂起、恢复、终止、杀死）
+- ✅ 系统启动时间和运行时间
+- ✅ 网络接口地址
+
 ### BSD 平台
 - ✅ 进程信息（名称、可执行文件、命令行、状态等）
 - ✅ 进程内存和 CPU 使用情况
@@ -89,6 +101,9 @@
 
 ### macOS 平台
 - [ ] 编译和测试
+
+### Android 平台
+- [ ] 使用 NDK 编译和测试
 
 ### BSD 平台
 - [ ] 编译和测试
@@ -118,10 +133,35 @@
    ./example
    ```
 
+### Android NDK 构建
+
+1. 设置 NDK 环境变量：
+   ```bash
+   export ANDROID_NDK=/path/to/android-ndk
+   ```
+
+2. 创建工具链文件 `android-toolchain.cmake`：
+   ```cmake
+   set(CMAKE_SYSTEM_NAME Android)
+   set(CMAKE_SYSTEM_VERSION 21)
+   set(CMAKE_ANDROID_ARCH_ABI arm64-v8a)
+   set(CMAKE_ANDROID_NDK $ENV{ANDROID_NDK})
+   set(CMAKE_ANDROID_STL_TYPE c++_static)
+   ```
+
+3. 配置并构建：
+   ```bash
+   mkdir build-android
+   cd build-android
+   cmake -DCMAKE_TOOLCHAIN_FILE=../android-toolchain.cmake ..
+   cmake --build .
+   ```
+
 ### 平台特定说明
 
 - **Windows**：需要 MinGW 或 Visual Studio
 - **Linux**：需要 gcc 和 libc-dev
+- **Android**：需要 Android NDK 和 CMake（API 21+）
 - **macOS**：需要 Xcode 命令行工具（注：因环境限制，未进行编译和测试）
 - **BSD**：需要适当的开发工具（注：因环境限制，未进行编译和测试）
 
@@ -159,6 +199,161 @@ int main() {
     psutil_cleanup();
     return 0;
 }
+```
+
+更多详细示例请参考 `example.c` 文件。
+
+## API 参考
+
+### 库初始化与清理
+
+| 函数 | 说明 | 返回值 |
+|------|------|--------|
+| `int psutil_init(void)` | 初始化 psutil 库 | 0 表示成功，非 0 表示失败 |
+
+### 进程操作
+
+#### Process 对象管理
+| 函数 | 说明 |
+|------|------|
+| `Process* process_new(uint32_t pid)` | 创建 Process 对象（pid=0 表示当前进程） |
+| `void process_free(Process* proc)` | 释放 Process 对象 |
+| `uint32_t process_get_pid(Process* proc)` | 获取进程 PID |
+| `uint32_t process_get_ppid(Process* proc)` | 获取父进程 PID |
+| `const char* process_get_name(Process* proc)` | 获取进程名称 |
+| `const char* process_get_exe(Process* proc)` | 获取可执行文件路径 |
+| `char** process_get_cmdline(Process* proc, int* count)` | 获取命令行参数 |
+| `int process_get_status(Process* proc)` | 获取进程状态 |
+| `const char* process_get_username(Process* proc)` | 获取进程用户名 |
+| `double process_get_create_time(Process* proc)` | 获取进程创建时间 |
+| `const char* process_get_cwd(Process* proc)` | 获取当前工作目录 |
+
+#### 进程资源使用
+| 函数 | 说明 |
+|------|------|
+| `psutil_memory_info process_get_memory_info(Process* proc)` | 获取内存信息 |
+| `psutil_memory_info process_get_memory_full_info(Process* proc)` | 获取完整内存信息（含 USS/PSS） |
+| `double process_get_memory_percent(Process* proc, const char* memtype)` | 获取内存使用百分比 |
+| `psutil_cpu_times process_get_cpu_times(Process* proc)` | 获取 CPU 时间统计 |
+| `int process_get_num_threads(Process* proc)` | 获取线程数 |
+| `psutil_thread* process_get_threads(Process* proc, int* count)` | 获取线程列表 |
+| `psutil_io_counters process_get_io_counters(Process* proc)` | 获取 I/O 统计 |
+| `psutil_ctx_switches process_get_num_ctx_switches(Process* proc)` | 获取上下文切换次数 |
+
+#### 进程控制
+| 函数 | 说明 | 返回值 |
+|------|------|--------|
+| `int process_send_signal(Process* proc, int sig)` | 发送信号 | 0 表示成功 |
+| `int process_suspend(Process* proc)` | 挂起进程 | 0 表示成功 |
+| `int process_resume(Process* proc)` | 恢复进程 | 0 表示成功 |
+| `int process_terminate(Process* proc)` | 终止进程 | 0 表示成功 |
+| `int process_kill(Process* proc)` | 强制结束进程 | 0 表示成功 |
+| `int process_is_running(Process* proc)` | 检查进程是否在运行 | 1 表示运行中 |
+
+#### 进程优先级
+| 函数 | 说明 |
+|------|------|
+| `int process_get_nice(Process* proc)` | 获取进程优先级（nice 值） |
+| `int process_set_nice(Process* proc, int value)` | 设置进程优先级 |
+| `int process_get_ionice(Process* proc)` | 获取 I/O 优先级 |
+| `int process_set_ionice(Process* proc, int ioclass, int value)` | 设置 I/O 优先级 |
+| `int* process_get_cpu_affinity(Process* proc, int* count)` | 获取 CPU 亲和性 |
+| `int process_set_cpu_affinity(Process* proc, int* cpus, int count)` | 设置 CPU 亲和性 |
+
+### 系统信息
+
+#### CPU 信息
+| 函数 | 说明 |
+|------|------|
+| `int cpu_count(int logical)` | 获取 CPU 核心数（1=逻辑核心，0=物理核心） |
+| `psutil_cpu_times cpu_times(int percpu)` | 获取 CPU 时间统计 |
+| `double cpu_percent(double interval, int percpu)` | 获取 CPU 使用率 |
+| `psutil_cpu_stats cpu_stats()` | 获取 CPU 统计信息 |
+
+#### 内存信息
+| 函数 | 说明 |
+|------|------|
+| `psutil_memory_info virtual_memory()` | 获取虚拟内存信息 |
+| `psutil_memory_info swap_memory()` | 获取交换内存信息 |
+
+#### 磁盘信息
+| 函数 | 说明 |
+|------|------|
+| `psutil_disk_partition* disk_partitions(int all)` | 获取磁盘分区列表 |
+| `psutil_disk_usage disk_usage(const char* path)` | 获取指定路径的磁盘使用情况 |
+| `psutil_io_counters disk_io_counters(int perdisk)` | 获取磁盘 I/O 统计 |
+
+#### 网络信息
+| 函数 | 说明 |
+|------|------|
+| `psutil_io_counters net_io_counters(int pernic)` | 获取网络 I/O 统计 |
+| `psutil_net_if_addr* net_if_addrs(int* count)` | 获取网络接口地址 |
+| `psutil_net_if_stat* net_if_stats(int* count)` | 获取网络接口状态 |
+| `psutil_net_connection* net_connections(const char* kind, int* count)` | 获取网络连接 |
+
+#### 其他系统信息
+| 函数 | 说明 |
+|------|------|
+| `uint32_t* pids(int* count)` | 获取所有运行中的进程 PID 列表 |
+| `int pid_exists(uint32_t pid)` | 检查 PID 是否存在 |
+| `double boot_time()` | 获取系统启动时间 |
+| `psutil_user* users(int* count)` | 获取登录用户信息 |
+
+### 数据结构
+
+#### psutil_memory_info
+```c
+typedef struct {
+    uint64_t rss;      // 实际使用内存
+    uint64_t vms;      // 虚拟内存大小
+    uint64_t shared;   // 共享内存
+    uint64_t text;     // 代码段大小
+    uint64_t lib;      // 库大小
+    uint64_t data;     // 数据段大小
+    uint64_t dirty;    // 脏页大小
+    uint64_t uss;      // 唯一集大小（Linux）
+    uint64_t pss;      // 比例集大小（Linux）
+} psutil_memory_info;
+```
+
+#### psutil_cpu_times
+```c
+typedef struct {
+    double user;           // 用户态时间
+    double system;         // 内核态时间
+    double children_user;  // 子进程用户态时间
+    double children_system;// 子进程内核态时间
+} psutil_cpu_times;
+```
+
+#### psutil_io_counters
+```c
+typedef struct {
+    uint64_t read_count;   // 读取次数
+    uint64_t write_count;  // 写入次数
+    uint64_t read_bytes;   // 读取字节数
+    uint64_t write_bytes;  // 写入字节数
+    uint64_t read_time;    // 读取时间
+    uint64_t write_time;   // 写入时间
+} psutil_io_counters;
+```
+
+### 常量定义
+
+#### 进程状态
+```c
+#define STATUS_RUNNING      0   // 运行中
+#define STATUS_IDLE         1   // 空闲
+#define STATUS_SLEEPING     2   // 睡眠
+#define STATUS_DISK_SLEEP   3   // 不可中断睡眠
+#define STATUS_STOPPED      4   // 停止
+#define STATUS_TRACING_STOP 5   // 跟踪停止
+#define STATUS_ZOMBIE       6   // 僵尸进程
+#define STATUS_DEAD         7   // 死亡
+#define STATUS_WAKING       8   // 唤醒中
+#define STATUS_LOCKED       9   // 锁定
+#define STATUS_WAITING     10   // 等待
+#define STATUS_PARKED      11   // 暂停
 ```
 
 ## 许可证

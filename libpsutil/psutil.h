@@ -10,9 +10,11 @@
 #include <stdint.h>
 
 // Platform detection
-#if !defined(PSUTIL_WINDOWS) && !defined(PSUTIL_LINUX) && !defined(PSUTIL_MACOS) && !defined(PSUTIL_BSD)
+#if !defined(PSUTIL_WINDOWS) && !defined(PSUTIL_LINUX) && !defined(PSUTIL_MACOS) && !defined(PSUTIL_BSD) && !defined(PSUTIL_ANDROID)
     #if defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)
         #define PSUTIL_WINDOWS
+    #elif defined(__ANDROID__) || defined(ANDROID)
+        #define PSUTIL_ANDROID
     #elif defined(__linux__) || defined(__linux) || defined(linux) || defined(__gnu_linux__)
         #define PSUTIL_LINUX
     #elif defined(__APPLE__) && defined(__MACH__)
@@ -403,6 +405,10 @@ int psutil_init(void);
 
 #ifdef PSUTIL_LINUX
 // Linux-specific functions
+#endif
+
+#ifdef PSUTIL_ANDROID
+// Android-specific functions
 #endif
 
 #ifdef PSUTIL_MACOS

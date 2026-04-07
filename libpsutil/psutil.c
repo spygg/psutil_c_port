@@ -20,6 +20,9 @@
 #ifdef PSUTIL_LINUX
 #include "arch/linux/psutil_linux.h"
 #endif
+#ifdef PSUTIL_ANDROID
+#include "arch/android/psutil_android.h"
+#endif
 #ifdef PSUTIL_MACOS
 #include "arch/macos/psutil_macos.h"
 #endif
@@ -36,6 +39,8 @@ Process* process_new(uint32_t pid) {
     return psutil_windows_process_new(pid);
 #elif PSUTIL_LINUX
     return psutil_linux_process_new(pid);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_new(pid);
 #elif PSUTIL_MACOS
     return psutil_macos_process_new(pid);
 #elif PSUTIL_BSD
@@ -73,6 +78,8 @@ void process_free(Process* proc) {
     psutil_windows_process_free(proc);
 #elif PSUTIL_LINUX
     psutil_linux_process_free(proc);
+#elif PSUTIL_ANDROID
+    psutil_android_process_free(proc);
 #elif PSUTIL_MACOS
     psutil_macos_process_free(proc);
 #elif PSUTIL_BSD
@@ -108,6 +115,8 @@ uint32_t process_get_ppid(Process* proc) {
     return psutil_windows_process_get_ppid(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_ppid(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_ppid(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_ppid(proc);
 #elif PSUTIL_BSD
@@ -122,6 +131,8 @@ const char* process_get_name(Process* proc) {
     return psutil_windows_process_get_name(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_name(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_name(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_name(proc);
 #elif PSUTIL_BSD
@@ -136,6 +147,8 @@ const char* process_get_exe(Process* proc) {
     return psutil_windows_process_get_exe(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_exe(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_exe(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_exe(proc);
 #elif PSUTIL_BSD
@@ -150,6 +163,8 @@ char** process_get_cmdline(Process* proc, int* count) {
     return psutil_windows_process_get_cmdline(proc, count);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_cmdline(proc, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_cmdline(proc, count);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_cmdline(proc, count);
 #elif PSUTIL_BSD
@@ -165,6 +180,8 @@ int process_get_status(Process* proc) {
     return psutil_windows_process_get_status(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_status(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_status(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_status(proc);
 #elif PSUTIL_BSD
@@ -179,6 +196,8 @@ const char* process_get_username(Process* proc) {
     return psutil_windows_process_get_username(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_username(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_username(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_username(proc);
 #elif PSUTIL_BSD
@@ -193,6 +212,8 @@ double process_get_create_time(Process* proc) {
     return psutil_windows_process_get_create_time(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_create_time(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_create_time(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_create_time(proc);
 #elif PSUTIL_BSD
@@ -207,6 +228,8 @@ const char* process_get_cwd(Process* proc) {
     return psutil_windows_process_get_cwd(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_cwd(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_cwd(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_cwd(proc);
 #elif PSUTIL_BSD
@@ -221,6 +244,8 @@ int process_get_nice(Process* proc) {
     return psutil_windows_process_get_nice(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_nice(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_nice(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_nice(proc);
 #elif PSUTIL_BSD
@@ -235,6 +260,8 @@ int process_set_nice(Process* proc, int value) {
     return psutil_windows_process_set_nice(proc, value);
 #elif PSUTIL_LINUX
     return psutil_linux_process_set_nice(proc, value);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_set_nice(proc, value);
 #elif PSUTIL_MACOS
     return psutil_macos_process_set_nice(proc, value);
 #elif PSUTIL_BSD
@@ -249,6 +276,8 @@ psutil_uids process_get_uids(Process* proc) {
     return psutil_windows_process_get_uids(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_uids(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_uids(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_uids(proc);
 #elif PSUTIL_BSD
@@ -264,6 +293,8 @@ psutil_gids process_get_gids(Process* proc) {
     return psutil_windows_process_get_gids(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_gids(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_gids(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_gids(proc);
 #elif PSUTIL_BSD
@@ -279,6 +310,8 @@ const char* process_get_terminal(Process* proc) {
     return psutil_windows_process_get_terminal(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_terminal(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_terminal(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_terminal(proc);
 #elif PSUTIL_BSD
@@ -293,6 +326,8 @@ int process_get_num_fds(Process* proc) {
     return psutil_windows_process_get_num_fds(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_num_fds(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_num_fds(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_num_fds(proc);
 #elif PSUTIL_BSD
@@ -307,6 +342,8 @@ psutil_io_counters process_get_io_counters(Process* proc) {
     return psutil_windows_process_get_io_counters(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_io_counters(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_io_counters(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_io_counters(proc);
 #elif PSUTIL_BSD
@@ -322,6 +359,8 @@ int process_get_ionice(Process* proc) {
     return psutil_windows_process_get_ionice(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_ionice(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_ionice(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_ionice(proc);
 #elif PSUTIL_BSD
@@ -336,6 +375,8 @@ int process_set_ionice(Process* proc, int ioclass, int value) {
     return psutil_windows_process_set_ionice(proc, ioclass, value);
 #elif PSUTIL_LINUX
     return psutil_linux_process_set_ionice(proc, ioclass, value);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_set_ionice(proc, ioclass, value);
 #elif PSUTIL_MACOS
     return psutil_macos_process_set_ionice(proc, ioclass, value);
 #elif PSUTIL_BSD
@@ -350,6 +391,8 @@ int* process_get_cpu_affinity(Process* proc, int* count) {
     return psutil_windows_process_get_cpu_affinity(proc, count);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_cpu_affinity(proc, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_cpu_affinity(proc, count);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_cpu_affinity(proc, count);
 #elif PSUTIL_BSD
@@ -365,6 +408,8 @@ int process_set_cpu_affinity(Process* proc, int* cpus, int count) {
     return psutil_windows_process_set_cpu_affinity(proc, cpus, count);
 #elif PSUTIL_LINUX
     return psutil_linux_process_set_cpu_affinity(proc, cpus, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_set_cpu_affinity(proc, cpus, count);
 #elif PSUTIL_MACOS
     return psutil_macos_process_set_cpu_affinity(proc, cpus, count);
 #elif PSUTIL_BSD
@@ -379,6 +424,8 @@ int process_get_cpu_num(Process* proc) {
     return psutil_windows_process_get_cpu_num(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_cpu_num(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_cpu_num(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_cpu_num(proc);
 #elif PSUTIL_BSD
@@ -393,6 +440,8 @@ char** process_get_environ(Process* proc, int* count) {
     return psutil_windows_process_get_environ(proc, count);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_environ(proc, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_environ(proc, count);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_environ(proc, count);
 #elif PSUTIL_BSD
@@ -408,6 +457,8 @@ int process_get_num_handles(Process* proc) {
     return psutil_windows_process_get_num_handles(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_num_handles(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_num_handles(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_num_handles(proc);
 #elif PSUTIL_BSD
@@ -422,6 +473,8 @@ psutil_ctx_switches process_get_num_ctx_switches(Process* proc) {
     return psutil_windows_process_get_num_ctx_switches(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_num_ctx_switches(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_num_ctx_switches(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_num_ctx_switches(proc);
 #elif PSUTIL_BSD
@@ -437,6 +490,8 @@ int process_get_num_threads(Process* proc) {
     return psutil_windows_process_get_num_threads(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_num_threads(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_num_threads(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_num_threads(proc);
 #elif PSUTIL_BSD
@@ -451,6 +506,8 @@ psutil_thread* process_get_threads(Process* proc, int* count) {
     return psutil_windows_process_get_threads(proc, count);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_threads(proc, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_threads(proc, count);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_threads(proc, count);
 #elif PSUTIL_BSD
@@ -466,6 +523,8 @@ psutil_cpu_times process_get_cpu_times(Process* proc) {
     return psutil_windows_process_get_cpu_times(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_cpu_times(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_cpu_times(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_cpu_times(proc);
 #elif PSUTIL_BSD
@@ -481,6 +540,8 @@ psutil_memory_info process_get_memory_info(Process* proc) {
     return psutil_windows_process_get_memory_info(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_memory_info(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_memory_info(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_memory_info(proc);
 #elif PSUTIL_BSD
@@ -496,6 +557,8 @@ psutil_memory_info process_get_memory_full_info(Process* proc) {
     return psutil_windows_process_get_memory_full_info(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_memory_full_info(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_memory_full_info(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_memory_full_info(proc);
 #elif PSUTIL_BSD
@@ -511,6 +574,8 @@ double process_get_memory_percent(Process* proc, const char* memtype) {
     return psutil_windows_process_get_memory_percent(proc, memtype);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_memory_percent(proc, memtype);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_memory_percent(proc, memtype);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_memory_percent(proc, memtype);
 #elif PSUTIL_BSD
@@ -525,6 +590,8 @@ psutil_memory_map* process_get_memory_maps(Process* proc, int* count, int groupe
     return psutil_windows_process_get_memory_maps(proc, count, grouped);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_memory_maps(proc, count, grouped);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_memory_maps(proc, count, grouped);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_memory_maps(proc, count, grouped);
 #elif PSUTIL_BSD
@@ -540,6 +607,8 @@ psutil_open_file* process_get_open_files(Process* proc, int* count) {
     return psutil_windows_process_get_open_files(proc, count);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_open_files(proc, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_open_files(proc, count);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_open_files(proc, count);
 #elif PSUTIL_BSD
@@ -555,6 +624,8 @@ psutil_net_connection* process_get_net_connections(Process* proc, const char* ki
     return psutil_windows_process_get_net_connections(proc, kind, count);
 #elif PSUTIL_LINUX
     return psutil_linux_process_get_net_connections(proc, kind, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_get_net_connections(proc, kind, count);
 #elif PSUTIL_MACOS
     return psutil_macos_process_get_net_connections(proc, kind, count);
 #elif PSUTIL_BSD
@@ -570,6 +641,8 @@ int process_send_signal(Process* proc, int sig) {
     return psutil_windows_process_send_signal(proc, sig);
 #elif PSUTIL_LINUX
     return psutil_linux_process_send_signal(proc, sig);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_send_signal(proc, sig);
 #elif PSUTIL_MACOS
     return psutil_macos_process_send_signal(proc, sig);
 #elif PSUTIL_BSD
@@ -584,6 +657,8 @@ int process_suspend(Process* proc) {
     return psutil_windows_process_suspend(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_suspend(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_suspend(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_suspend(proc);
 #elif PSUTIL_BSD
@@ -598,6 +673,8 @@ int process_resume(Process* proc) {
     return psutil_windows_process_resume(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_resume(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_resume(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_resume(proc);
 #elif PSUTIL_BSD
@@ -612,6 +689,8 @@ int process_terminate(Process* proc) {
     return psutil_windows_process_terminate(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_terminate(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_terminate(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_terminate(proc);
 #elif PSUTIL_BSD
@@ -626,6 +705,8 @@ int process_kill(Process* proc) {
     return psutil_windows_process_kill(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_kill(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_kill(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_kill(proc);
 #elif PSUTIL_BSD
@@ -640,6 +721,8 @@ int process_wait(Process* proc, double timeout) {
     return psutil_windows_process_wait(proc, timeout);
 #elif PSUTIL_LINUX
     return psutil_linux_process_wait(proc, timeout);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_wait(proc, timeout);
 #elif PSUTIL_MACOS
     return psutil_macos_process_wait(proc, timeout);
 #elif PSUTIL_BSD
@@ -654,6 +737,8 @@ int process_is_running(Process* proc) {
     return psutil_windows_process_is_running(proc);
 #elif PSUTIL_LINUX
     return psutil_linux_process_is_running(proc);
+#elif PSUTIL_ANDROID
+    return psutil_android_process_is_running(proc);
 #elif PSUTIL_MACOS
     return psutil_macos_process_is_running(proc);
 #elif PSUTIL_BSD
@@ -672,6 +757,8 @@ int pid_exists(uint32_t pid) {
     return psutil_windows_pid_exists(pid);
 #elif PSUTIL_LINUX
     return psutil_linux_pid_exists(pid);
+#elif PSUTIL_ANDROID
+    return psutil_android_pid_exists(pid);
 #elif PSUTIL_MACOS
     return psutil_macos_pid_exists(pid);
 #elif PSUTIL_BSD
@@ -686,6 +773,8 @@ uint32_t* pids(int* count) {
     return psutil_windows_pids(count);
 #elif PSUTIL_LINUX
     return psutil_linux_pids(count);
+#elif PSUTIL_ANDROID
+    return psutil_android_pids(count);
 #elif PSUTIL_MACOS
     return psutil_macos_pids(count);
 #elif PSUTIL_BSD
@@ -701,6 +790,8 @@ psutil_memory_info virtual_memory() {
     return psutil_windows_virtual_memory();
 #elif PSUTIL_LINUX
     return psutil_linux_virtual_memory();
+#elif PSUTIL_ANDROID
+    return psutil_android_virtual_memory();
 #elif PSUTIL_MACOS
     return psutil_macos_virtual_memory();
 #elif PSUTIL_BSD
@@ -716,6 +807,8 @@ psutil_memory_info swap_memory() {
     return psutil_windows_swap_memory();
 #elif PSUTIL_LINUX
     return psutil_linux_swap_memory();
+#elif PSUTIL_ANDROID
+    return psutil_android_swap_memory();
 #elif PSUTIL_MACOS
     return psutil_macos_swap_memory();
 #elif PSUTIL_BSD
@@ -731,6 +824,8 @@ psutil_cpu_times cpu_times(int percpu) {
     return psutil_windows_cpu_times(percpu);
 #elif PSUTIL_LINUX
     return psutil_linux_cpu_times(percpu);
+#elif PSUTIL_ANDROID
+    return psutil_android_cpu_times(percpu);
 #elif PSUTIL_MACOS
     return psutil_macos_cpu_times(percpu);
 #elif PSUTIL_BSD
@@ -746,6 +841,8 @@ double cpu_percent(double interval, int percpu) {
     return psutil_windows_cpu_percent(interval, percpu);
 #elif PSUTIL_LINUX
     return psutil_linux_cpu_percent(interval, percpu);
+#elif PSUTIL_ANDROID
+    return psutil_android_cpu_percent(interval, percpu);
 #elif PSUTIL_MACOS
     return psutil_macos_cpu_percent(interval, percpu);
 #elif PSUTIL_BSD
@@ -760,6 +857,8 @@ psutil_cpu_times cpu_times_percent(double interval, int percpu) {
     return psutil_windows_cpu_times_percent(interval, percpu);
 #elif PSUTIL_LINUX
     return psutil_linux_cpu_times_percent(interval, percpu);
+#elif PSUTIL_ANDROID
+    return psutil_android_cpu_times_percent(interval, percpu);
 #elif PSUTIL_MACOS
     return psutil_macos_cpu_times_percent(interval, percpu);
 #elif PSUTIL_BSD
@@ -775,6 +874,8 @@ int cpu_count(int logical) {
     return psutil_windows_cpu_count(logical);
 #elif PSUTIL_LINUX
     return psutil_linux_cpu_count(logical);
+#elif PSUTIL_ANDROID
+    return psutil_android_cpu_count(logical);
 #elif PSUTIL_MACOS
     return psutil_macos_cpu_count(logical);
 #elif PSUTIL_BSD
@@ -789,6 +890,8 @@ psutil_cpu_stats cpu_stats() {
     return psutil_windows_cpu_stats();
 #elif PSUTIL_LINUX
     return psutil_linux_cpu_stats();
+#elif PSUTIL_ANDROID
+    return psutil_android_cpu_stats();
 #elif PSUTIL_MACOS
     return psutil_macos_cpu_stats();
 #elif PSUTIL_BSD
@@ -804,6 +907,8 @@ psutil_io_counters net_io_counters(int pernic) {
     return psutil_windows_net_io_counters(pernic);
 #elif PSUTIL_LINUX
     return psutil_linux_net_io_counters(pernic);
+#elif PSUTIL_ANDROID
+    return psutil_android_net_io_counters(pernic);
 #elif PSUTIL_MACOS
     return psutil_macos_net_io_counters(pernic);
 #elif PSUTIL_BSD
@@ -819,6 +924,8 @@ psutil_net_connection* net_connections(const char* kind, int* count) {
     return psutil_windows_net_connections(kind, count);
 #elif PSUTIL_LINUX
     return psutil_linux_net_connections(kind, count);
+#elif PSUTIL_ANDROID
+    return psutil_android_net_connections(kind, count);
 #elif PSUTIL_MACOS
     return psutil_macos_net_connections(kind, count);
 #elif PSUTIL_BSD
@@ -834,6 +941,8 @@ psutil_net_if_addr* net_if_addrs(int* count) {
     return psutil_windows_net_if_addrs(count);
 #elif PSUTIL_LINUX
     return psutil_linux_net_if_addrs(count);
+#elif PSUTIL_ANDROID
+    return psutil_android_net_if_addrs(count);
 #elif PSUTIL_MACOS
     return psutil_macos_net_if_addrs(count);
 #elif PSUTIL_BSD
@@ -849,6 +958,8 @@ psutil_net_if_stat* net_if_stats(int* count) {
     return psutil_windows_net_if_stats(count);
 #elif PSUTIL_LINUX
     return psutil_linux_net_if_stats(count);
+#elif PSUTIL_ANDROID
+    return psutil_android_net_if_stats(count);
 #elif PSUTIL_MACOS
     return psutil_macos_net_if_stats(count);
 #elif PSUTIL_BSD
@@ -864,6 +975,8 @@ psutil_io_counters disk_io_counters(int perdisk) {
     return psutil_windows_disk_io_counters(perdisk);
 #elif PSUTIL_LINUX
     return psutil_linux_disk_io_counters(perdisk);
+#elif PSUTIL_ANDROID
+    return psutil_android_disk_io_counters(perdisk);
 #elif PSUTIL_MACOS
     return psutil_macos_disk_io_counters(perdisk);
 #elif PSUTIL_BSD
@@ -879,6 +992,8 @@ psutil_disk_partition* disk_partitions(int all) {
     return psutil_windows_disk_partitions(all);
 #elif PSUTIL_LINUX
     return psutil_linux_disk_partitions(all);
+#elif PSUTIL_ANDROID
+    return psutil_android_disk_partitions(all);
 #elif PSUTIL_MACOS
     return psutil_macos_disk_partitions(all);
 #elif PSUTIL_BSD
@@ -893,6 +1008,8 @@ psutil_disk_usage disk_usage(const char* path) {
     return psutil_windows_disk_usage(path);
 #elif PSUTIL_LINUX
     return psutil_linux_disk_usage(path);
+#elif PSUTIL_ANDROID
+    return psutil_android_disk_usage(path);
 #elif PSUTIL_MACOS
     return psutil_macos_disk_usage(path);
 #elif PSUTIL_BSD
@@ -908,6 +1025,8 @@ psutil_user* users(int* count) {
     return psutil_windows_users(count);
 #elif PSUTIL_LINUX
     return psutil_linux_users(count);
+#elif PSUTIL_ANDROID
+    return psutil_android_users(count);
 #elif PSUTIL_MACOS
     return psutil_macos_users(count);
 #elif PSUTIL_BSD
@@ -923,6 +1042,8 @@ double boot_time() {
     return psutil_windows_boot_time();
 #elif PSUTIL_LINUX
     return psutil_linux_boot_time();
+#elif PSUTIL_ANDROID
+    return psutil_android_boot_time();
 #elif PSUTIL_MACOS
     return psutil_macos_boot_time();
 #elif PSUTIL_BSD
@@ -940,6 +1061,8 @@ int psutil_init(void) {
     return result;
 #elif PSUTIL_LINUX
     return psutil_linux_init();
+#elif PSUTIL_ANDROID
+    return psutil_android_init();
 #elif PSUTIL_MACOS
     return psutil_macos_init();
 #elif PSUTIL_BSD

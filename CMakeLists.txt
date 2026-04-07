@@ -24,6 +24,13 @@ if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
     target_link_libraries(example rt)
 endif()
 
+# Link necessary libraries for Android
+if(ANDROID)
+    # Android Bionic libc includes pthread, no need to link separately
+    # Some functions may require log library
+    target_link_libraries(example log)
+endif()
+
 # Installation
 install(TARGETS example
     RUNTIME DESTINATION bin
