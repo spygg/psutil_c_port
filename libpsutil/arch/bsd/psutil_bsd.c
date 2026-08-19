@@ -10,6 +10,22 @@
 #include <time.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <devstat.h>
+#include <netinet/in.h>
+#include <netinet/tcp_fsm.h>
+#include <netinet/in_pcb.h>
+#include <netinet/tcp_var.h>
+#include <netinet/tcp.h>
+#include <netinet/udp_var.h>
+#include <net/if.h>
+#include <net/if_mib.h>
+#include <net/if_dl.h>
+#include <sys/mount.h>
+#include <sys/resource.h>
+#include <utmp.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <unistd.h>
 #include "../../psutil.h"
@@ -22,21 +38,21 @@ int psutil_bsd_init(void) {
 }
 
 // Process functions
-int psutil_bsd_pid_exists(pid_t pid) {
+int psutil_bsd_pid_exists(psutil_pid_t pid) {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d", pid);
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-pid_t* psutil_bsd_pids(int *count) {
+psutil_pid_t* psutil_bsd_pids(int *count) {
     DIR *dir;
     struct dirent *entry;
-    pid_t *pids = NULL;
+    psutil_pid_t *pids = NULL;
     int size = 1024;
     int index = 0;
 
-    pids = (pid_t*)malloc(size * sizeof(pid_t));
+    pids = (psutil_pid_t*)malloc(size * sizeof(psutil_pid_t));
     if (pids == NULL) {
         *count = 0;
         return NULL;
@@ -50,11 +66,11 @@ pid_t* psutil_bsd_pids(int *count) {
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        pid_t pid = atoi(entry->d_name);
+        int pid = atoi(entry->d_name);
         if (pid > 0) {
             if (index >= size) {
                 size *= 2;
-                pid_t *new_pids = (pid_t*)realloc(pids, size * sizeof(pid_t));
+                psutil_pid_t *new_pids = (psutil_pid_t*)realloc(pids, size * sizeof(psutil_pid_t));
                 if (new_pids == NULL) {
                     free(pids);
                     closedir(dir);
@@ -74,7 +90,7 @@ pid_t* psutil_bsd_pids(int *count) {
 
 #include <unistd.h>
 
-Process* psutil_bsd_process_new(pid_t pid) {
+Process* psutil_bsd_process_new(psutil_pid_t pid) {
     Process* proc = (Process*)malloc(sizeof(Process));
     if (proc == NULL) {
         return NULL;
@@ -118,7 +134,7 @@ void psutil_bsd_process_free(Process* proc) {
     free(proc);
 }
 
-pid_t psutil_bsd_process_get_ppid(Process* proc) {
+psutil_pid_t psutil_bsd_process_get_ppid(Process* proc) {
     if (proc == NULL) {
         return 0;
     }
@@ -300,10 +316,10 @@ double psutil_bsd_process_get_create_time(Process* proc) {
     size_t len = sizeof(kp);
     
     if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0) {
-        struct timespec ts;
+        struct timeval ts;
         ts.tv_sec = kp.ki_start.tv_sec;
-        ts.tv_nsec = kp.ki_start.tv_nsec;
-        return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+        ts.tv_usec = kp.ki_start.tv_usec;
+        return (double)ts.tv_sec + (double)ts.tv_usec / 1e6;
     }
     
     return 0.0;
@@ -430,36 +446,22 @@ psutil_io_counters psutil_bsd_process_get_io_counters(Process* proc) {
         return counters;
     }
     
-    // Get process I/O statistics using sysctl
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_IO, proc->pid};
-    struct kinfo_proc *kp;
-    size_t len;
-    
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0) {
+    // FreeBSD: use getrusage to get per-process I/O statistics.
+    // ru_inblock/ru_oublock are counts of blocks, not bytes.
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) != 0) {
+        // getrusage only works for the current process and its children.
+        // For arbitrary processes this is not directly supported.
         return counters;
     }
     
-    kp = (struct kinfo_proc*)malloc(len);
-    if (kp == NULL) {
-        return counters;
-    }
-    
-    if (sysctl(mib, 4, kp, &len, NULL, 0) != 0) {
-        free(kp);
-        return counters;
-    }
-    
-    // Fill in I/O counters
-    // Note: The exact fields may vary depending on the BSD variant
-    // This is a generic implementation
-    counters.read_count = 0;
-    counters.write_count = 0;
+    counters.read_count = (uint64_t)ru.ru_inblock;
+    counters.write_count = (uint64_t)ru.ru_oublock;
     counters.read_bytes = 0;
     counters.write_bytes = 0;
     counters.read_time = 0;
     counters.write_time = 0;
     
-    free(kp);
     return counters;
 }
 
@@ -800,30 +802,51 @@ psutil_memory_info psutil_bsd_virtual_memory(void) {
 psutil_memory_info psutil_bsd_swap_memory(void) {
     psutil_memory_info info = {0};
     
-    int mib[2] = {CTL_VM, VM_SWAPUSAGE};
-    struct swapusage su;
-    size_t len = sizeof(su);
-    
-    if (sysctl(mib, 2, &su, &len, NULL, 0) == 0) {
-        info.total = su.su_total;
-        info.used = su.su_used;
-        info.free = su.su_free;
-        info.percent = (double)su.su_used / su.su_total * 100.0;
+    // FreeBSD: kern.swap_info returns an array of struct xswdev
+    int mib[2] = {CTL_VM, VM_SWAPSTATS};
+    size_t len = 0;
+    if (sysctl(mib, 2, NULL, &len, NULL, 0) != 0 || len == 0) {
+        return info;
     }
     
+    struct xswdev *xsw = (struct xswdev*)malloc(len);
+    if (xsw == NULL) {
+        return info;
+    }
+    
+    if (sysctl(mib, 2, xsw, &len, NULL, 0) != 0) {
+        free(xsw);
+        return info;
+    }
+    
+    uint64_t total = 0, used = 0;
+    int count = (int)(len / sizeof(struct xswdev));
+    for (int i = 0; i < count; i++) {
+        total += xsw[i].xsw_nblks * xsw[i].xsw_bsize;
+        used += xsw[i].xsw_used * xsw[i].xsw_bsize;
+    }
+    free(xsw);
+    
+    info.vms = total;
+    info.rss = used;
     return info;
 }
 
 psutil_cpu_times psutil_bsd_cpu_times(int percpu) {
+    (void)percpu;
     psutil_cpu_times times = {0};
     
     int mib[2] = {CTL_KERN, KERN_CPTIME};
-    struct timeval tv[CPUSTATES];
+    long tv[CPUSTATES];
     size_t len = sizeof(tv);
+    double clk_tck = (double)sysconf(_SC_CLK_TCK);
+    if (clk_tck <= 0) {
+        clk_tck = 100.0;
+    }
     
     if (sysctl(mib, 2, tv, &len, NULL, 0) == 0) {
-        times.user = (double)tv[CP_USER].tv_sec + (double)tv[CP_USER].tv_usec / 1e6;
-        times.system = (double)tv[CP_SYS].tv_sec + (double)tv[CP_SYS].tv_usec / 1e6;
+        times.user = (double)tv[CP_USER] / clk_tck;
+        times.system = (double)tv[CP_SYS] / clk_tck;
         times.children_user = 0.0;
         times.children_system = 0.0;
     }
@@ -832,27 +855,29 @@ psutil_cpu_times psutil_bsd_cpu_times(int percpu) {
 }
 
 double psutil_bsd_cpu_percent(double interval, int percpu) {
+    (void)percpu;
+    if (interval <= 0.0) {
+        return 0.0;
+    }
     // Get initial CPU times
     psutil_cpu_times start = psutil_bsd_cpu_times(0);
     
     // Sleep for the specified interval
-    if (interval > 0.0) {
-        usleep((unsigned int)(interval * 1e6));
-    }
+    usleep((unsigned int)(interval * 1e6));
     
     // Get final CPU times
     psutil_cpu_times end = psutil_bsd_cpu_times(0);
     
-    // Calculate CPU usage
+    // Calculate CPU usage as busy delta over wall-clock interval
     double user_diff = end.user - start.user;
     double system_diff = end.system - start.system;
     double total_diff = user_diff + system_diff;
     
-    if (total_diff == 0.0) {
+    if (total_diff <= 0.0) {
         return 0.0;
     }
     
-    return (user_diff + system_diff) / total_diff * 100.0;
+    return (total_diff / interval) * 100.0;
 }
 
 psutil_cpu_times psutil_bsd_cpu_times_percent(double interval, int percpu) {
@@ -869,17 +894,17 @@ psutil_cpu_times psutil_bsd_cpu_times_percent(double interval, int percpu) {
     // Get final CPU times
     psutil_cpu_times end = psutil_bsd_cpu_times(0);
     
-    // Calculate CPU usage
+    // Calculate CPU usage as percentage of wall-clock interval
     double user_diff = end.user - start.user;
     double system_diff = end.system - start.system;
     double total_diff = user_diff + system_diff;
     
-    if (total_diff == 0.0) {
+    if (total_diff <= 0.0) {
         return times;
     }
     
-    times.user = user_diff / total_diff * 100.0;
-    times.system = system_diff / total_diff * 100.0;
+    times.user = (user_diff / interval) * 100.0;
+    times.system = (system_diff / interval) * 100.0;
     times.children_user = 0.0;
     times.children_system = 0.0;
     
@@ -916,44 +941,28 @@ psutil_cpu_stats psutil_bsd_cpu_stats(void) {
 }
 
 psutil_io_counters psutil_bsd_net_io_counters(int pernic) {
+    (void)pernic;
     psutil_io_counters counters = {0};
     
-    // TODO: Implement pernic support
-    if (pernic) {
+    // FreeBSD: iterate over interfaces via net.link.iftable
+    int ifcount = 0;
+    size_t csize = sizeof(ifcount);
+    if (sysctlbyname("net.link.generic.system.ifcount", &ifcount, &csize, NULL, 0) != 0 || ifcount <= 0) {
         return counters;
     }
     
-    int mib[4] = {CTL_NET, PF_LINK, LINK_IFTABLE, 0};
-    size_t len;
-    
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0) {
-        return counters;
+    for (int idx = 1; idx <= ifcount; idx++) {
+        int mib[6] = {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, idx, IFDATA_GENERAL};
+        struct ifmibdata ifmd;
+        size_t len = sizeof(ifmd);
+        if (sysctl(mib, 6, &ifmd, &len, NULL, 0) == 0) {
+            counters.read_count += ifmd.ifmd_data.ifi_ipackets;
+            counters.write_count += ifmd.ifmd_data.ifi_opackets;
+            counters.read_bytes += ifmd.ifmd_data.ifi_ibytes;
+            counters.write_bytes += ifmd.ifmd_data.ifi_obytes;
+        }
     }
     
-    struct ifmibdata *ifmib = (struct ifmibdata*)malloc(len);
-    if (ifmib == NULL) {
-        return counters;
-    }
-    
-    if (sysctl(mib, 4, ifmib, &len, NULL, 0) != 0) {
-        free(ifmib);
-        return counters;
-    }
-    
-    // Calculate total network I/O
-    struct ifmibdata *ifmd = ifmib;
-    for (int i = 0; i < ifmib->ifmd_len; i++) {
-        counters.read_count += ifmd->ifmd_data.ifi_ipackets;
-        counters.write_count += ifmd->ifmd_data.ifi_opackets;
-        counters.read_bytes += ifmd->ifmd_data.ifi_ibytes;
-        counters.write_bytes += ifmd->ifmd_data.ifi_obytes;
-        counters.errin += ifmd->ifmd_data.ifi_ierrors;
-        counters.errout += ifmd->ifmd_data.ifi_oerrors;
-        counters.dropin += ifmd->ifmd_data.ifi_iqdrops;
-        ifmd = (struct ifmibdata*)((char*)ifmd + ifmd->ifmd_len);
-    }
-    
-    free(ifmib);
     return counters;
 }
 
@@ -1125,7 +1134,7 @@ psutil_net_if_addr* psutil_bsd_net_if_addrs(int* count) {
     }
     
     // Allocate memory for the interface addresses
-    psutil_net_if_addr* addrs = (psutil_net_if_addr*)malloc(if_count * sizeof(psutil_net_if_addr));
+    psutil_net_if_addr* addrs = (psutil_net_if_addr*)calloc(if_count, sizeof(psutil_net_if_addr));
     if (addrs == NULL) {
         freeifaddrs(ifaddr);
         return NULL;
@@ -1138,23 +1147,34 @@ psutil_net_if_addr* psutil_bsd_net_if_addrs(int* count) {
             continue;
         }
         
-        strncpy(addrs[index].interface, ifa->ifa_name, sizeof(addrs[index].interface) - 1);
+        strncpy(addrs[index].name, ifa->ifa_name, sizeof(addrs[index].name) - 1);
+        addrs[index].name[sizeof(addrs[index].name) - 1] = '\0';
+        addrs[index].family = ifa->ifa_addr->sa_family;
         
         if (ifa->ifa_addr->sa_family == AF_INET) {
             struct sockaddr_in* addr = (struct sockaddr_in*)ifa->ifa_addr;
             struct sockaddr_in* netmask = (struct sockaddr_in*)ifa->ifa_netmask;
             snprintf(addrs[index].address, sizeof(addrs[index].address), "%s",
                     inet_ntoa(addr->sin_addr));
-            snprintf(addrs[index].netmask, sizeof(addrs[index].netmask), "%s",
-                    inet_ntoa(netmask->sin_addr));
-            // Calculate broadcast address
-            struct in_addr broadcast;
-            broadcast.s_addr = addr->sin_addr.s_addr | (~netmask->sin_addr.s_addr);
-            snprintf(addrs[index].broadcast, sizeof(addrs[index].broadcast), "%s",
-                    inet_ntoa(broadcast));
+            if (netmask != NULL) {
+                snprintf(addrs[index].netmask, sizeof(addrs[index].netmask), "%s",
+                        inet_ntoa(netmask->sin_addr));
+                // Calculate broadcast address
+                struct in_addr broadcast;
+                broadcast.s_addr = addr->sin_addr.s_addr | (~netmask->sin_addr.s_addr);
+                snprintf(addrs[index].broadcast, sizeof(addrs[index].broadcast), "%s",
+                        inet_ntoa(broadcast));
+            } else {
+                addrs[index].netmask[0] = '\0';
+                addrs[index].broadcast[0] = '\0';
+            }
         } else if (ifa->ifa_addr->sa_family == AF_INET6) {
             // IPv6 handling
-            addrs[index].address[0] = '\0';
+            struct sockaddr_in6* addr6 = (struct sockaddr_in6*)ifa->ifa_addr;
+            char tmp[INET6_ADDRSTRLEN];
+            if (inet_ntop(AF_INET6, &addr6->sin6_addr, tmp, sizeof(tmp)) != NULL) {
+                strncpy(addrs[index].address, tmp, sizeof(addrs[index].address) - 1);
+            }
             addrs[index].netmask[0] = '\0';
             addrs[index].broadcast[0] = '\0';
         }
@@ -1163,82 +1183,83 @@ psutil_net_if_addr* psutil_bsd_net_if_addrs(int* count) {
     }
     
     freeifaddrs(ifaddr);
-    *count = if_count;
+    *count = index;
+    if (index == 0) {
+        free(addrs);
+        return NULL;
+    }
     return addrs;
 }
 
 psutil_net_if_stat* psutil_bsd_net_if_stats(int* count) {
     *count = 0;
     
-    int mib[4] = {CTL_NET, PF_LINK, LINK_IFTABLE, 0};
-    size_t len;
-    
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0) {
+    int ifcount = 0;
+    size_t csize = sizeof(ifcount);
+    if (sysctlbyname("net.link.generic.system.ifcount", &ifcount, &csize, NULL, 0) != 0 || ifcount <= 0) {
         return NULL;
     }
     
-    struct ifmibdata *ifmib = (struct ifmibdata*)malloc(len);
-    if (ifmib == NULL) {
-        return NULL;
-    }
-    
-    if (sysctl(mib, 4, ifmib, &len, NULL, 0) != 0) {
-        free(ifmib);
-        return NULL;
-    }
-    
-    // Count the number of interfaces
-    int if_count = ifmib->ifmd_len;
-    if (if_count == 0) {
-        free(ifmib);
-        return NULL;
-    }
-    
-    // Allocate memory for the interface stats
-    psutil_net_if_stat* stats = (psutil_net_if_stat*)malloc(if_count * sizeof(psutil_net_if_stat));
+    psutil_net_if_stat* stats = (psutil_net_if_stat*)calloc(ifcount, sizeof(psutil_net_if_stat));
     if (stats == NULL) {
-        free(ifmib);
         return NULL;
     }
     
-    // Fill in the interface stats
-    struct ifmibdata *ifmd = ifmib;
-    for (int i = 0; i < if_count; i++) {
-        strncpy(stats[i].interface, ifmd->ifmd_name, sizeof(stats[i].interface) - 1);
-        stats[i].isup = ifmd->ifmd_data.ifi_flags & IFF_UP ? 1 : 0;
-        stats[i].speed = ifmd->ifmd_data.ifi_baudrate;
-        stats[i].mtu = ifmd->ifmd_data.ifi_mtu;
-        ifmd = (struct ifmibdata*)((char*)ifmd + ifmd->ifmd_len);
+    int index = 0;
+    for (int idx = 1; idx <= ifcount; idx++) {
+        int mib[6] = {CTL_NET, PF_LINK, NETLINK_GENERIC, IFMIB_IFDATA, idx, IFDATA_GENERAL};
+        struct ifmibdata ifmd;
+        size_t len = sizeof(ifmd);
+        if (sysctl(mib, 6, &ifmd, &len, NULL, 0) != 0) {
+            continue;
+        }
+        
+        strncpy(stats[index].name, ifmd.ifmd_name, sizeof(stats[index].name) - 1);
+        stats[index].name[sizeof(stats[index].name) - 1] = '\0';
+        stats[index].isup = (ifmd.ifmd_data.ifi_flags & IFF_UP) ? 1 : 0;
+        stats[index].speed = (int)(ifmd.ifmd_data.ifi_baudrate / 1000000);
+        stats[index].mtu = ifmd.ifmd_data.ifi_mtu;
+        stats[index].duplex = NIC_DUPLEX_UNKNOWN;
+        index++;
     }
     
-    free(ifmib);
-    *count = if_count;
+    *count = index;
+    if (index == 0) {
+        free(stats);
+        return NULL;
+    }
     return stats;
 }
 
 psutil_io_counters psutil_bsd_disk_io_counters(int perdisk) {
+    (void)perdisk;
     psutil_io_counters counters = {0};
     
-    // TODO: Implement per disk support
-    if (perdisk) {
-        *count = 0;
-        return NULL;
+    // Use the FreeBSD devstat framework via sysctl
+    size_t len = 0;
+    if (sysctlbyname("kern.devstat.all", NULL, &len, NULL, 0) != 0 || len == 0) {
+        return counters;
     }
     
-    // Get disk I/O statistics using sysctl
-    int mib[2] = {CTL_VFS, VFS_DISKSTATS};
-    struct diskstats stats;
-    size_t len = sizeof(stats);
-    
-    if (sysctl(mib, 2, &stats, &len, NULL, 0) == 0) {
-        counters.read_count = stats.ds_rxfer;
-        counters.write_count = stats.ds_wxfer;
-        counters.read_bytes = stats.ds_rbytes;
-        counters.write_bytes = stats.ds_wbytes;
-        counters.read_time = 0; // Not available
-        counters.write_time = 0; // Not available
+    struct devstat *stats = (struct devstat*)malloc(len);
+    if (stats == NULL) {
+        return counters;
     }
     
+    if (sysctlbyname("kern.devstat.all", stats, &len, NULL, 0) != 0) {
+        free(stats);
+        return counters;
+    }
+    
+    int num_devices = (int)(len / sizeof(struct devstat));
+    for (int i = 0; i < num_devices; i++) {
+        counters.read_count += stats[i].ds_operations[DEVSTAT_READ];
+        counters.write_count += stats[i].ds_operations[DEVSTAT_WRITE];
+        counters.read_bytes += stats[i].ds_bytes[DEVSTAT_READ];
+        counters.write_bytes += stats[i].ds_bytes[DEVSTAT_WRITE];
+    }
+    
+    free(stats);
     return counters;
 }
 
@@ -1333,7 +1354,9 @@ psutil_disk_usage psutil_bsd_disk_usage(const char* path) {
         usage.total = (uint64_t)sfs.f_blocks * sfs.f_bsize;
         usage.free = (uint64_t)sfs.f_bavail * sfs.f_bsize;
         usage.used = usage.total - usage.free;
-        usage.percent = (double)usage.used / usage.total * 100.0;
+        if (usage.total > 0) {
+            usage.percent = (double)usage.used / usage.total * 100.0;
+        }
     }
     return usage;
 }
@@ -1371,7 +1394,8 @@ psutil_user* psutil_bsd_users(int* count) {
     int index = 0;
     while ((ut = getutxent()) != NULL && index < user_count) {
         if (ut->ut_type == USER_PROCESS) {
-            strncpy(users[index].user, ut->ut_user, sizeof(users[index].user) - 1);
+            strncpy(users[index].name, ut->ut_user, sizeof(users[index].name) - 1);
+    users[index].name[sizeof(users[index].name) - 1] = '\0';
             strncpy(users[index].terminal, ut->ut_line, sizeof(users[index].terminal) - 1);
             users[index].host[0] = '\0'; // TODO: Get host information if available
             users[index].started = (double)ut->ut_tv.tv_sec + (double)ut->ut_tv.tv_usec / 1e6;

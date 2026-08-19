@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <inttypes.h>
 #include "libpsutil/psutil.h"
 
 int main() {
@@ -22,7 +23,7 @@ int main() {
         fprintf(stderr, "Failed to create process object\n");
         return 1;
     }
-    printf("Process object created successfully, PID: %u\n", process_get_pid(proc));
+    printf("Process object created successfully, PID: %d\n", process_get_pid(proc));
     
     // ==================== CPU Information ====================
     printf("=== CPU Information ===\n");
@@ -44,7 +45,7 @@ int main() {
     
     // CPU statistics
     psutil_cpu_stats cpu_stats_info = cpu_stats();
-    printf("CPU stats: ctx_switches=%d, interrupts=%d, soft_interrupts=%d, syscalls=%d\n", 
+    printf("CPU stats: ctx_switches=%" PRIu64 ", interrupts=%" PRIu64 ", soft_interrupts=%" PRIu64 ", syscalls=%" PRIu64 "\n", 
            cpu_stats_info.ctx_switches, cpu_stats_info.interrupts, 
            cpu_stats_info.soft_interrupts, cpu_stats_info.syscalls);
     
@@ -53,26 +54,35 @@ int main() {
     
     // Virtual memory
     psutil_memory_info vmem = virtual_memory();
-    printf("Virtual memory: total=%.2f GB, available=%.2f GB, usage=%.2f%%\n", 
-           vmem.vms / (1024.0 * 1024.0 * 1024.0), 
-           (vmem.vms - vmem.rss) / (1024.0 * 1024.0 * 1024.0), 
-           (double)vmem.rss / vmem.vms * 100.0);
+    double vmem_total_gb = vmem.vms / (1024.0 * 1024.0 * 1024.0);
+    printf("Virtual memory: total=%.2f GB, available=%.2f GB, used=%.2f GB, usage=%.2f%%\n", 
+           vmem_total_gb, 
+           vmem.shared / (1024.0 * 1024.0 * 1024.0),
+           vmem.rss / (1024.0 * 1024.0 * 1024.0), 
+           vmem_total_gb > 0.0 ? (double)vmem.rss / vmem.vms * 100.0 : 0.0);
     
     // Swap memory
     psutil_memory_info smem = swap_memory();
+    double smem_total_gb = smem.vms / (1024.0 * 1024.0 * 1024.0);
     printf("Swap memory: total=%.2f GB, used=%.2f GB, usage=%.2f%%\n", 
-           smem.vms / (1024.0 * 1024.0 * 1024.0), 
+           smem_total_gb, 
            smem.rss / (1024.0 * 1024.0 * 1024.0), 
-           (double)smem.rss / smem.vms * 100.0);
+           smem_total_gb > 0.0 ? (double)smem.rss / smem.vms * 100.0 : 0.0);
     
     // ==================== Disk Information ====================
     printf("\n=== Disk Information ===\n");
     
     // Disk partitions
+    int part_count = 0;
     psutil_disk_partition* partitions = disk_partitions(1);
     if (partitions != NULL) {
-        int i = 0;
-        while (partitions[i].device[0] != '\0') {
+        // Count partitions by checking device[0] != '\0'
+        // Note: disk_partitions returns a pointer to an array, not necessarily NULL-terminated.
+        // We rely on the count returned by the function if available, or scan until empty.
+        for (int i = 0; partitions[i].device[0] != '\0'; i++) {
+            part_count++;
+        }
+        for (int i = 0; i < part_count; i++) {
             printf("Partition: device=%s, mountpoint=%s, fstype=%s\n", 
                    partitions[i].device, partitions[i].mountpoint, partitions[i].fstype);
             
@@ -83,14 +93,13 @@ int main() {
                    usage.used / (1024.0 * 1024.0 * 1024.0), 
                    usage.free / (1024.0 * 1024.0 * 1024.0), 
                    usage.percent);
-            i++;
         }
         free(partitions);
     }
     
     // Disk I/O statistics
     psutil_io_counters disk_io = disk_io_counters(0);
-    printf("Disk I/O: read=%.2f GB, write=%.2f GB, read_count=%llu, write_count=%llu\n", 
+    printf("Disk I/O: read=%.2f GB, write=%.2f GB, read_count=%" PRIu64 ", write_count=%" PRIu64 "\n", 
            disk_io.read_bytes / (1024.0 * 1024.0 * 1024.0), 
            disk_io.write_bytes / (1024.0 * 1024.0 * 1024.0), 
            disk_io.read_count, disk_io.write_count);
@@ -132,14 +141,14 @@ int main() {
     
     // Get all process PIDs
     int pid_count = 0;
-    uint32_t* pids_list = pids(&pid_count);
+    psutil_pid_t* pids_list = pids(&pid_count);
     printf("Total running processes: %d\n", pid_count);
     if (pids_list != NULL) {
         free(pids_list);
     }
     
     // Current process details
-    uint32_t pid = process_get_pid(proc);
+    psutil_pid_t pid = process_get_pid(proc);
     printf("\nCurrent process (PID=%u):\n", pid);
     printf("  Name: %s\n", process_get_name(proc));
     printf("  Executable: %s\n", process_get_exe(proc));
@@ -157,7 +166,7 @@ int main() {
     
     // Process memory information
     psutil_memory_info mem_info = process_get_memory_info(proc);
-    printf("  Memory info: RSS=%llu bytes, VMS=%llu bytes\n", 
+    printf("  Memory info: RSS=%" PRIu64 " bytes, VMS=%" PRIu64 " bytes\n", 
            mem_info.rss, mem_info.vms);
     
     // Process CPU time

@@ -81,21 +81,21 @@ static int read_int_from_file(const char* path, int* value) {
 }
 
 // Process functions
-int psutil_android_pid_exists(pid_t pid) {
+int psutil_android_pid_exists(psutil_pid_t pid) {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d", pid);
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-pid_t* psutil_android_pids(int *count) {
+psutil_pid_t* psutil_android_pids(int *count) {
     DIR *dir;
     struct dirent *entry;
-    pid_t *pids_list = NULL;
+    psutil_pid_t *pids_list = NULL;
     int size = 1024;
     int index = 0;
 
-    pids_list = (pid_t*)malloc(size * sizeof(pid_t));
+    pids_list = (psutil_pid_t*)malloc(size * sizeof(psutil_pid_t));
     if (pids_list == NULL) {
         *count = 0;
         return NULL;
@@ -109,11 +109,11 @@ pid_t* psutil_android_pids(int *count) {
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        pid_t pid = atoi(entry->d_name);
+        int pid = atoi(entry->d_name);
         if (pid > 0) {
             if (index >= size) {
                 size *= 2;
-                pid_t *new_pids = (pid_t*)realloc(pids_list, size * sizeof(pid_t));
+                psutil_pid_t *new_pids = (psutil_pid_t*)realloc(pids_list, size * sizeof(psutil_pid_t));
                 if (new_pids == NULL) {
                     free(pids_list);
                     closedir(dir);
@@ -131,7 +131,7 @@ pid_t* psutil_android_pids(int *count) {
     return pids_list;
 }
 
-Process* psutil_android_process_new(pid_t pid) {
+Process* psutil_android_process_new(psutil_pid_t pid) {
     Process* proc = (Process*)malloc(sizeof(Process));
     if (proc == NULL) {
         return NULL;
@@ -218,7 +218,7 @@ void psutil_android_process_free(Process* proc) {
     free(proc);
 }
 
-pid_t psutil_android_process_get_ppid(Process* proc) {
+psutil_pid_t psutil_android_process_get_ppid(Process* proc) {
     char path[256];
     char buffer[1024];
     snprintf(path, sizeof(path), "/proc/%d/stat", proc->pid);
@@ -526,7 +526,7 @@ const char* psutil_android_process_get_terminal(Process* proc) {
         char* p = strchr(buffer, ')');
         if (p != NULL) {
             // Fields: pid, comm, state, ppid, pgrp, session, tty_nr
-            if (sscanf(p + 2, "%*c %*d %*d %*d %*d %d", &tty_nr) >= 1) {
+            if (sscanf(p + 2, "%*c %*d %*d %*d %d", &tty_nr) >= 1) {
                 if (tty_nr == 0) {
                     return NULL; // No controlling terminal
                 }
@@ -646,10 +646,16 @@ int* psutil_android_process_get_cpu_affinity(Process* proc, int* count) {
 }
 
 int psutil_android_process_set_cpu_affinity(Process* proc, int* cpus, int count) {
+    if (proc == NULL || cpus == NULL || count < 0) {
+        return -1;
+    }
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
     
     for (int i = 0; i < count; i++) {
+        if (cpus[i] < 0) {
+            return -1;
+        }
         CPU_SET(cpus[i], &cpu_set);
     }
     
@@ -912,17 +918,20 @@ psutil_memory_info psutil_android_process_get_memory_full_info(Process* proc) {
 }
 
 double psutil_android_process_get_memory_percent(Process* proc, const char* memtype) {
+    if (proc == NULL || memtype == NULL) {
+        return 0.0;
+    }
     psutil_memory_info info = psutil_android_process_get_memory_info(proc);
     psutil_memory_info total = psutil_android_virtual_memory();
     
-    if (total.total == 0) {
+    if (total.vms == 0) {
         return 0.0;
     }
     
     if (strcmp(memtype, "rss") == 0) {
-        return 100.0 * (double)info.rss / (double)total.total;
+        return 100.0 * (double)info.rss / (double)total.vms;
     } else if (strcmp(memtype, "vms") == 0) {
-        return 100.0 * (double)info.vms / (double)total.total;
+        return 100.0 * (double)info.vms / (double)total.vms;
     }
     
     return 0.0;
@@ -1060,28 +1069,10 @@ psutil_memory_info psutil_android_virtual_memory(void) {
     
     struct sysinfo si;
     if (sysinfo(&si) == 0) {
-        long page_size = sysconf(_SC_PAGESIZE);
-        
-        info.total = si.totalram * si.mem_unit;
-        info.free = si.freeram * si.mem_unit;
-        info.used = info.total - info.free;
-        
-        // Read additional info from /proc/meminfo
-        FILE* fp = fopen("/proc/meminfo", "r");
-        if (fp != NULL) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp) != NULL) {
-                unsigned long long value;
-                if (sscanf(line, "Buffers: %llu", &value) == 1) {
-                    // Buffers
-                } else if (sscanf(line, "Cached: %llu", &value) == 1) {
-                    // Cached memory
-                } else if (sscanf(line, "Slab: %llu", &value) == 1) {
-                    // Slab
-                }
-            }
-            fclose(fp);
-        }
+        info.vms = (uint64_t)si.totalram * si.mem_unit;
+        info.rss = (uint64_t)(si.totalram - si.freeram) * si.mem_unit;
+        info.shared = (uint64_t)si.bufferram * si.mem_unit;
+        info.data = (uint64_t)si.sharedram * si.mem_unit;
     }
     
     return info;
@@ -1092,9 +1083,8 @@ psutil_memory_info psutil_android_swap_memory(void) {
     
     struct sysinfo si;
     if (sysinfo(&si) == 0) {
-        info.total = si.totalswap * si.mem_unit;
-        info.free = si.freeswap * si.mem_unit;
-        info.used = info.total - info.free;
+        info.vms = (uint64_t)si.totalswap * si.mem_unit;
+        info.rss = (uint64_t)(si.totalswap - si.freeswap) * si.mem_unit;
     }
     
     return info;
@@ -1124,30 +1114,38 @@ psutil_cpu_times psutil_android_cpu_times(int percpu) {
 }
 
 double psutil_android_cpu_percent(double interval, int percpu) {
+    if (interval <= 0) {
+        return 0.0;
+    }
     psutil_cpu_times t1 = psutil_android_cpu_times(percpu);
     
-    if (interval > 0) {
-        usleep((useconds_t)(interval * 1000000));
-    }
+    usleep((useconds_t)(interval * 1000000));
     
     psutil_cpu_times t2 = psutil_android_cpu_times(percpu);
     
     double total_diff = (t2.user + t2.system) - (t1.user + t1.system);
-    double user_diff = t2.user - t1.user;
-    double system_diff = t2.system - t1.system;
-    
-    // This is a simplified calculation
-    // Real implementation would need idle time calculation
-    if (total_diff > 0) {
-        return 100.0 * total_diff / (total_diff + 0.001); // Simplified
+    if (total_diff < 0.0) {
+        total_diff = 0.0;
     }
     
-    return 0.0;
+    // busy time over wall-clock interval
+    return 100.0 * total_diff / interval;
 }
 
 psutil_cpu_times psutil_android_cpu_times_percent(double interval, int percpu) {
-    // Simplified implementation
-    return psutil_android_cpu_times(percpu);
+    psutil_cpu_times times = {0, 0, 0, 0};
+    if (interval <= 0) {
+        return times;
+    }
+    psutil_cpu_times t1 = psutil_android_cpu_times(percpu);
+    
+    usleep((useconds_t)(interval * 1000000));
+    
+    psutil_cpu_times t2 = psutil_android_cpu_times(percpu);
+    
+    times.user = 100.0 * (t2.user - t1.user) / interval;
+    times.system = 100.0 * (t2.system - t1.system) / interval;
+    return times;
 }
 
 int psutil_android_cpu_count(int logical) {
@@ -1172,11 +1170,11 @@ psutil_cpu_stats psutil_android_cpu_stats(void) {
     while (fgets(line, sizeof(line), fp) != NULL) {
         unsigned long long value;
         if (sscanf(line, "ctxt %llu", &value) == 1) {
-            stats.ctx_switches = (int)value;
+            stats.ctx_switches = value;
         } else if (sscanf(line, "intr %llu", &value) == 1) {
-            stats.interrupts = (int)value;
+            stats.interrupts = value;
         } else if (sscanf(line, "softirq %llu", &value) == 1) {
-            stats.soft_interrupts = (int)value;
+            stats.soft_interrupts = value;
         }
     }
     

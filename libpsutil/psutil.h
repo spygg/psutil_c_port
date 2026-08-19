@@ -7,6 +7,10 @@
 #ifndef PSUTIL_H
 #define PSUTIL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 // Platform detection
@@ -41,6 +45,7 @@
 #define STATUS_LOCKED 9
 #define STATUS_WAITING 10
 #define STATUS_PARKED 11
+#define STATUS_WAKE_KILL 12
 
 // Connection status constants
 #define CONN_ESTABLISHED 1
@@ -68,6 +73,11 @@
 // ====================================================================
 // --- Types
 // ====================================================================
+
+// Cross-platform process ID type
+// pid_t on Unix is signed int; DWORD on Windows is unsigned.
+// Real-world PIDs fit comfortably in int32_t on all supported platforms.
+typedef int32_t psutil_pid_t;
 
 typedef struct {
     uint32_t real;
@@ -117,7 +127,7 @@ typedef struct {
 } psutil_ctx_switches;
 
 typedef struct {
-    int id;
+    uint32_t id;
     double user_time;
     double system_time;
 } psutil_thread;
@@ -152,28 +162,28 @@ typedef struct {
 // ====================================================================
 
 typedef struct Process {
-    uint32_t pid;
+    psutil_pid_t pid;
     char* name;
     char* exe;
     char* cwd;
     char* username;
     double create_time;
-    uint32_t ppid;
+    psutil_pid_t ppid;
     int status;
 } Process;
 
 // Create a new Process object for the given PID
 // If pid is 0, use the current process PID
-Process* process_new(uint32_t pid);
+Process* process_new(psutil_pid_t pid);
 
 // Free a Process object
 void process_free(Process* proc);
 
 // Get the process PID
-uint32_t process_get_pid(Process* proc);
+psutil_pid_t process_get_pid(Process* proc);
 
 // Get the process parent PID
-uint32_t process_get_ppid(Process* proc);
+psutil_pid_t process_get_ppid(Process* proc);
 
 // Get the process name
 const char* process_get_name(Process* proc);
@@ -235,6 +245,12 @@ int process_get_cpu_num(Process* proc);
 // Get the process environment variables
 char** process_get_environ(Process* proc, int* count);
 
+// Free a string array returned by process_get_cmdline or process_get_environ
+void psutil_free_string_array(char** arr, int count);
+
+// Free a pointer array returned by pids, net_if_addrs, net_if_stats, etc.
+// For arrays of structs (not arrays of pointers), simply call free().
+
 // Get the number of handles opened by the process (Windows only)
 int process_get_num_handles(Process* proc);
 
@@ -294,10 +310,10 @@ int process_is_running(Process* proc);
 // ====================================================================
 
 // Check if a PID exists
-int pid_exists(uint32_t pid);
+int pid_exists(psutil_pid_t pid);
 
 // Get a list of all running process PIDs
-uint32_t* pids(int* count);
+psutil_pid_t* pids(int* count);
 
 // Get virtual memory information
 psutil_memory_info virtual_memory();
@@ -319,10 +335,10 @@ int cpu_count(int logical);
 
 // Get CPU statistics
 typedef struct {
-    int ctx_switches;
-    int interrupts;
-    int soft_interrupts;
-    int syscalls;
+    uint64_t ctx_switches;
+    uint64_t interrupts;
+    uint64_t soft_interrupts;
+    uint64_t syscalls;
 } psutil_cpu_stats;
 
 psutil_cpu_stats cpu_stats();
@@ -336,6 +352,7 @@ psutil_net_connection* net_connections(const char* kind, int* count);
 // Get network interface addresses
 typedef struct {
     char name[64];
+    int family;
     char address[256];
     char netmask[256];
     char broadcast[256];
@@ -394,6 +411,7 @@ double boot_time();
 // --- Library initialization
 // ====================================================================
 int psutil_init(void);
+void psutil_cleanup(void);
 
 // ====================================================================
 // --- Platform-specific functions
@@ -417,6 +435,10 @@ int psutil_init(void);
 
 #ifdef PSUTIL_BSD
 // BSD-specific functions
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif // PSUTIL_H

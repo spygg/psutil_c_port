@@ -20,10 +20,23 @@
 #include <utmp.h>
 #include <sched.h>
 #include <ifaddrs.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+#include <inttypes.h>
+#include <sys/sysmacros.h>
+#include <linux/ioprio.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include "../../psutil.h"
 #include "psutil_linux.h"
+
+// Forward declarations for socket-inode helpers used by
+// psutil_linux_process_get_net_connections
+static int collect_socket_inodes(pid_t pid, unsigned long* inodes, int max_inodes);
+static int read_proc_net_tcp(const char* path, int family, psutil_net_connection* connections, int max_count, int offset,
+                             const unsigned long* pid_filter, int pid_filter_count);
+static int read_proc_net_udp(const char* path, int family, psutil_net_connection* connections, int max_count, int offset,
+                             const unsigned long* pid_filter, int pid_filter_count);
 
 // Initialize the library
 int psutil_linux_init(void) {
@@ -32,21 +45,21 @@ int psutil_linux_init(void) {
 }
 
 // Process functions
-int psutil_linux_pid_exists(pid_t pid) {
+int psutil_linux_pid_exists(psutil_pid_t pid) {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d", pid);
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-pid_t* psutil_linux_pids(int *count) {
+psutil_pid_t* psutil_linux_pids(int *count) {
     DIR *dir;
     struct dirent *entry;
-    pid_t *pids = NULL;
+    psutil_pid_t *pids = NULL;
     int size = 1024;
     int index = 0;
 
-    pids = (pid_t*)malloc(size * sizeof(pid_t));
+    pids = (psutil_pid_t*)malloc(size * sizeof(psutil_pid_t));
     if (pids == NULL) {
         *count = 0;
         return NULL;
@@ -60,11 +73,11 @@ pid_t* psutil_linux_pids(int *count) {
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        pid_t pid = atoi(entry->d_name);
+        int pid = atoi(entry->d_name);
         if (pid > 0) {
             if (index >= size) {
                 size *= 2;
-                pid_t *new_pids = (pid_t*)realloc(pids, size * sizeof(pid_t));
+                psutil_pid_t *new_pids = (psutil_pid_t*)realloc(pids, size * sizeof(psutil_pid_t));
                 if (new_pids == NULL) {
                     free(pids);
                     closedir(dir);
@@ -82,9 +95,7 @@ pid_t* psutil_linux_pids(int *count) {
     return pids;
 }
 
-#include <unistd.h>
-
-Process* psutil_linux_process_new(pid_t pid) {
+Process* psutil_linux_process_new(psutil_pid_t pid) {
     Process* proc = (Process*)malloc(sizeof(Process));
     if (proc == NULL) {
         return NULL;
@@ -128,7 +139,7 @@ void psutil_linux_process_free(Process* proc) {
     free(proc);
 }
 
-pid_t psutil_linux_process_get_ppid(Process* proc) {
+psutil_pid_t psutil_linux_process_get_ppid(Process* proc) {
     if (proc == NULL) {
         return 0;
     }
@@ -246,6 +257,15 @@ char** psutil_linux_process_get_cmdline(Process* proc, int* count) {
     p = cmdline;
     for (int i = 0; i < argc; i++) {
         argv[i] = strdup(p);
+        if (argv[i] == NULL) {
+            // strdup failed, free what we have allocated so far
+            for (int j = 0; j < i; j++) {
+                free(argv[j]);
+            }
+            free(argv);
+            *count = 0;
+            return NULL;
+        }
         // Skip to the next null separator
         while (*p) p++;
         p++;
@@ -268,27 +288,30 @@ int psutil_linux_process_get_status(Process* proc) {
         return STATUS_RUNNING;
     }
     
-    char state;
+    char state = '?';
     char line[1024];
     if (fgets(line, sizeof(line), fp) != NULL) {
-        // Parse the state field (3rd field)
         char* close_paren = strrchr(line, ')');
         if (close_paren != NULL) {
-            sscanf(close_paren + 1, " %c", &state);
-            switch (state) {
-                case 'R': return STATUS_RUNNING;
-                case 'S': return STATUS_SLEEPING;
-                case 'D': return STATUS_DISK_SLEEP;
-                case 'Z': return STATUS_ZOMBIE;
-                case 'T': return STATUS_STOPPED;
-                case 't': return STATUS_TRACING_STOP;
-                case 'X': case 'x': return STATUS_DEAD;
-                case 'I': return STATUS_IDLE;
-                default: return STATUS_RUNNING;
+            if (sscanf(close_paren + 1, " %c", &state) == 1) {
+                int result = STATUS_RUNNING;
+                switch (state) {
+                    case 'R': result = STATUS_RUNNING; break;
+                    case 'S': result = STATUS_SLEEPING; break;
+                    case 'D': result = STATUS_DISK_SLEEP; break;
+                    case 'Z': result = STATUS_ZOMBIE; break;
+                    case 'T': result = STATUS_STOPPED; break;
+                    case 't': result = STATUS_TRACING_STOP; break;
+                    case 'X': case 'x': result = STATUS_DEAD; break;
+                    case 'I': result = STATUS_IDLE; break;
+                    default: result = STATUS_RUNNING; break;
+                }
+                fclose(fp);
+                return result;
             }
         }
     }
-    
+
     fclose(fp);
     return STATUS_RUNNING;
 }
@@ -340,14 +363,19 @@ double psutil_linux_process_get_create_time(Process* proc) {
         char line[1024];
         if (fgets(line, sizeof(line), fp) != NULL) {
             unsigned long long starttime;
-            // Skip the first 21 fields to get to starttime
-            if (sscanf(line, "%*d %*s %*c %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %*lu %*lu %*lu %*ld %*ld %*ld %*ld %*ld %llu", &starttime) == 1) {
-                // Convert to seconds since epoch
-                struct sysinfo si;
-                if (sysinfo(&si) == 0) {
-                    double uptime = si.uptime;
-                    double boot_time = time(NULL) - uptime;
-                    proc->create_time = boot_time + (double)starttime / sysconf(_SC_CLK_TCK);
+            char* close_paren = strrchr(line, ')');
+            if (close_paren != NULL) {
+                // starttime is the 22nd field overall, i.e. the 20th field after ')'
+                // Fields after ')': state ppid pgrp session tty_nr tpgid flags minflt
+                // cminflt majflt cmajflt utime stime cutime cstime priority nice
+                // num_threads itrealvalue starttime
+                if (sscanf(close_paren + 1, " %*s %*d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %*lu %*lu %*ld %*ld %*ld %*ld %*ld %*ld %llu", &starttime) == 1) {
+                    struct sysinfo si;
+                    if (sysinfo(&si) == 0) {
+                        double uptime = si.uptime;
+                        double boot_time = time(NULL) - uptime;
+                        proc->create_time = boot_time + (double)starttime / sysconf(_SC_CLK_TCK);
+                    }
                 }
             }
         }
@@ -449,25 +477,39 @@ const char* psutil_linux_process_get_terminal(Process* proc) {
     if (fp == NULL) {
         return NULL;
     }
-    
-    char tty[32];
+
     char line[1024];
     if (fgets(line, sizeof(line), fp) != NULL) {
-        // Parse the tty field (7th field)
         char* close_paren = strrchr(line, ')');
         if (close_paren != NULL) {
-            // Skip state, ppid, pgrp, session, tty_nr, tpgid
-            sscanf(close_paren + 1, " %*c %*d %*d %*d %s", tty);
-            // Check if tty is 0 (no terminal)
-            if (strcmp(tty, "0") != 0) {
-                // Convert tty number to device name
-                static char terminal[32];
-                snprintf(terminal, sizeof(terminal), "/dev/%s", tty);
+            int tty_nr = 0;
+            // Fields after ')': state ppid pgrp session tty_nr ...
+            sscanf(close_paren + 1, " %*c %*d %*d %*d %d", &tty_nr);
+            if (tty_nr != 0) {
+                // Convert tty_nr to device path using major()/minor()
+                unsigned int maj = major(tty_nr);
+                unsigned int min = minor(tty_nr);
+                static char terminal[64];
+                // Common terminal device patterns:
+                // major 4 (TTY), major 136 (Unix98 PTY), major 5 (alternate TTY)
+                if (maj == 4 && min < 64) {
+                    snprintf(terminal, sizeof(terminal), "/dev/tty%d", min);
+                } else if (maj == 136) {
+                    snprintf(terminal, sizeof(terminal), "/dev/pts/%d", min);
+                } else if (maj == 5 && min == 0) {
+                    snprintf(terminal, sizeof(terminal), "/dev/tty");
+                } else if (maj == 5 && min == 1) {
+                    snprintf(terminal, sizeof(terminal), "/dev/console");
+                } else {
+                    snprintf(terminal, sizeof(terminal), "/dev/tty%c%d",
+                             'a' + (min >> 8) - 3, min & 0xff);
+                }
+                fclose(fp);
                 return terminal;
             }
         }
     }
-    
+
     fclose(fp);
     return NULL;
 }
@@ -531,40 +573,19 @@ int psutil_linux_process_get_ionice(Process* proc) {
     if (proc == NULL) {
         return 0;
     }
-    
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/ionice", proc->pid);
-    FILE *fp = fopen(path, "r");
-    if (fp == NULL) {
+    long ret = syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, (long)proc->pid);
+    if (ret < 0) {
         return 0;
     }
-    
-    int ioclass = 0, value = 0;
-    char line[256];
-    if (fgets(line, sizeof(line), fp) != NULL) {
-        sscanf(line, "%*s: class %d, prio %d", &ioclass, &value);
-    }
-    
-    fclose(fp);
-    return ioclass;
+    return (int)(ret >> IOPRIO_CLASS_SHIFT);
 }
 
 int psutil_linux_process_set_ionice(Process* proc, int ioclass, int value) {
     if (proc == NULL) {
         return -1;
     }
-    
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/ionice", proc->pid);
-    FILE *fp = fopen(path, "w");
-    if (fp == NULL) {
-        return -1;
-    }
-    
-    int ret = fprintf(fp, "%d %d", ioclass, value);
-    fclose(fp);
-    
-    return ret > 0 ? 0 : -1;
+    long ioprio = IOPRIO_PRIO_VALUE(ioclass, value);
+    return (int)syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, (long)proc->pid, ioprio);
 }
 
 int* psutil_linux_process_get_cpu_affinity(Process* proc, int* count) {
@@ -580,8 +601,11 @@ int* psutil_linux_process_get_cpu_affinity(Process* proc, int* count) {
         return NULL;
     }
     
-    // Allocate memory for CPU mask
-    size_t mask_size = (cpu_count + 7) / 8;
+    // Allocate memory for CPU mask. The kernel requires len to be a
+    // multiple of sizeof(unsigned long) (cpumask_size()), otherwise
+    // sched_getaffinity fails with EINVAL.
+    size_t mask_size = ((size_t)cpu_count + 7) / 8;
+    mask_size = (mask_size + sizeof(unsigned long) - 1) / sizeof(unsigned long) * sizeof(unsigned long);
     unsigned char* mask = (unsigned char*)calloc(mask_size, 1);
     if (mask == NULL) {
         *count = 0;
@@ -589,7 +613,7 @@ int* psutil_linux_process_get_cpu_affinity(Process* proc, int* count) {
     }
     
     // Get CPU affinity
-    if (sched_getaffinity(proc->pid, mask_size, mask) != 0) {
+    if (sched_getaffinity(proc->pid, mask_size, (cpu_set_t*)mask) != 0) {
         free(mask);
         *count = 0;
         return NULL;
@@ -629,8 +653,9 @@ int psutil_linux_process_set_cpu_affinity(Process* proc, int* cpus, int count) {
         return -1;
     }
     
-    // Allocate memory for CPU mask
-    size_t mask_size = (cpu_count + 7) / 8;
+    // Allocate memory for CPU mask (multiple of sizeof(unsigned long))
+    size_t mask_size = ((size_t)cpu_count + 7) / 8;
+    mask_size = (mask_size + sizeof(unsigned long) - 1) / sizeof(unsigned long) * sizeof(unsigned long);
     unsigned char* mask = (unsigned char*)calloc(mask_size, 1);
     if (mask == NULL) {
         return -1;
@@ -647,7 +672,7 @@ int psutil_linux_process_set_cpu_affinity(Process* proc, int* cpus, int count) {
     }
     
     // Set CPU affinity
-    int result = sched_setaffinity(proc->pid, mask_size, mask) == 0 ? 0 : -1;
+    int result = sched_setaffinity(proc->pid, mask_size, (cpu_set_t*)mask) == 0 ? 0 : -1;
     free(mask);
     return result;
 }
@@ -667,11 +692,17 @@ int psutil_linux_process_get_cpu_num(Process* proc) {
     int cpu_num = -1;
     char line[1024];
     if (fgets(line, sizeof(line), fp) != NULL) {
-        // Parse the cpu field (39th field)
+        // Parse the processor field (39th field overall, 37th after ')')
         char* close_paren = strrchr(line, ')');
         if (close_paren != NULL) {
-            // Skip many fields to get to cpu
-            sscanf(close_paren + 1, " %*c %*d %*d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %*lu %*lu %*ld %*ld %*ld %*ld %*ld %*ld %*llu %*lu %*ld %d", &cpu_num);
+            // Skip 36 fields: state ppid pgrp session tty_nr tpgid flags minflt
+            // cminflt majflt cmajflt utime stime cutime cstime priority nice
+            // num_threads itrealvalue starttime vsize rss rsslim startcode endcode
+            // startstack kstkesp kstkeip signal blocked sigignore sigcatch wchan
+            // nswap cnswap exit_signal, then read processor
+            sscanf(close_paren + 1,
+                   " %*s %*d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %*lu %*lu %*ld %*ld %*ld %*ld %*ld %*ld %*llu %*lu %*ld %*lu %*lu %*lu %*lu %*lu %*lu %*lu %*lu %*lu %*lu %*lu %*lu %*ld %d",
+                   &cpu_num);
         }
     }
     
@@ -727,6 +758,15 @@ char** psutil_linux_process_get_environ(Process* proc, int* count) {
     p = environ;
     for (int i = 0; i < env_count; i++) {
         env_vars[i] = strdup(p);
+        if (env_vars[i] == NULL) {
+            // strdup failed, free what we have allocated so far
+            for (int j = 0; j < i; j++) {
+                free(env_vars[j]);
+            }
+            free(env_vars);
+            *count = 0;
+            return NULL;
+        }
         // Skip to the next null separator
         while (*p) p++;
         p++;
@@ -762,9 +802,9 @@ psutil_ctx_switches psutil_linux_process_get_num_ctx_switches(Process* proc) {
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "voluntary_ctxt_switches:", 23) == 0) {
-            sscanf(line, "voluntary_ctxt_switches:	%llu", &switches.voluntary);
+            sscanf(line, "voluntary_ctxt_switches:	%" SCNu64, &switches.voluntary);
         } else if (strncmp(line, "nonvoluntary_ctxt_switches:", 25) == 0) {
-            sscanf(line, "nonvoluntary_ctxt_switches:	%llu", &switches.involuntary);
+            sscanf(line, "nonvoluntary_ctxt_switches:	%" SCNu64, &switches.involuntary);
         }
     }
     
@@ -854,10 +894,12 @@ psutil_thread* psutil_linux_process_get_threads(Process* proc, int* count) {
             if (fp != NULL) {
                 char line[1024];
                 if (fgets(line, sizeof(line), fp) != NULL) {
-                    unsigned long utime, stime;
+                    unsigned long utime = 0, stime = 0;
                     char* close_paren = strrchr(line, ')');
                     if (close_paren != NULL) {
-                        sscanf(close_paren + 1, " %*c %*d %*d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %*lu %lu %lu", &utime, &stime);
+                        // utime/stime are the 12th/13th fields after ')'
+                        if (sscanf(close_paren + 1, " %*s %*d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %lu %lu",
+                                   &utime, &stime) >= 1) {
                         long clock_ticks = sysconf(_SC_CLK_TCK);
                         if (clock_ticks > 0) {
                             threads[index].user_time = (double)utime / clock_ticks;
@@ -870,6 +912,7 @@ psutil_thread* psutil_linux_process_get_threads(Process* proc, int* count) {
             
             index++;
         }
+    }
     }
     closedir(dir);
     
@@ -895,12 +938,14 @@ psutil_cpu_times psutil_linux_process_get_cpu_times(Process* proc) {
     if (fgets(line, sizeof(line), fp)) {
         // Parse stat file - format is complex, we need utime (14) and stime (15)
         // The command name is in parentheses and may contain spaces
-        unsigned long utime, stime;
+        unsigned long utime = 0, stime = 0;
         char* close_paren = strrchr(line, ')');
         if (close_paren != NULL) {
-            // Skip past the command and parse the rest
-            sscanf(close_paren + 1, "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu %lu",
-                   &utime, &stime);
+            // utime and stime are the 14th/15th fields overall, i.e. the
+            // 12th/13th fields after ')'. Skip the 11 leading fields:
+            // state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
+            if (sscanf(close_paren + 1, " %*s %*d %*d %*d %*d %*d %*u %*lu %*lu %*lu %*lu %lu %lu",
+                       &utime, &stime) >= 1) {
             
             // Convert from clock ticks to seconds
             long clock_ticks = sysconf(_SC_CLK_TCK);
@@ -909,6 +954,7 @@ psutil_cpu_times psutil_linux_process_get_cpu_times(Process* proc) {
                 times.system = (double)stime / clock_ticks;
             }
         }
+    }
     }
     fclose(fp);
     return times;
@@ -953,11 +999,26 @@ double psutil_linux_process_get_memory_percent(Process* proc, const char* memtyp
     if (system_mem.vms == 0) {
         return 0.0;
     }
+
+    uint64_t proc_value = proc_mem.rss;
+    if (memtype != NULL) {
+        if (strcmp(memtype, "vms") == 0) {
+            proc_value = proc_mem.vms;
+        } else if (strcmp(memtype, "shared") == 0) {
+            proc_value = proc_mem.shared;
+        } else if (strcmp(memtype, "data") == 0) {
+            proc_value = proc_mem.data;
+        } else if (strcmp(memtype, "text") == 0) {
+            proc_value = proc_mem.text;
+        }
+        // Default to rss for "rss" or unknown memtype
+    }
     
-    return (double)proc_mem.rss / system_mem.vms * 100.0;
+    return (double)proc_value / (double)system_mem.vms * 100.0;
 }
 
 psutil_memory_map* psutil_linux_process_get_memory_maps(Process* proc, int* count, int grouped) {
+    (void)grouped;
     if (proc == NULL) {
         *count = 0;
         return NULL;
@@ -985,7 +1046,7 @@ psutil_memory_map* psutil_linux_process_get_memory_maps(Process* proc, int* coun
     
     while (fgets(line, sizeof(line), fp) != NULL) {
         // Check if this is a header line (starts with hex address)
-        if (line[0] >= '0' && line[0] <= '9' || line[0] >= 'a' && line[0] <= 'f') {
+        if ((line[0] >= '0' && line[0] <= '9') || (line[0] >= 'a' && line[0] <= 'f')) {
             // Save previous entry if we have one
             if (index > 0 && current.path[0] != '\0') {
                 if (index >= capacity) {
@@ -1173,41 +1234,42 @@ psutil_net_connection* psutil_linux_process_get_net_connections(Process* proc, c
         return NULL;
     }
     
-    // Get all connections
-    psutil_net_connection* all_connections = psutil_linux_net_connections(kind, count);
-    if (all_connections == NULL || *count == 0) {
+    // Collect the socket inodes opened by this process
+    unsigned long inodes[512];
+    int inode_count = collect_socket_inodes(proc->pid, inodes, 512);
+    if (inode_count <= 0) {
+        *count = 0;
         return NULL;
     }
     
-    // Filter connections by process PID
+    // Determine what types of connections to retrieve
+    int get_tcp = (kind == NULL || strcmp(kind, "inet") == 0 || strcmp(kind, "tcp4") == 0 || strcmp(kind, "tcp") == 0);
+    int get_tcp6 = (kind == NULL || strcmp(kind, "inet") == 0 || strcmp(kind, "tcp6") == 0 || strcmp(kind, "tcp") == 0);
+    int get_udp = (kind == NULL || strcmp(kind, "inet") == 0 || strcmp(kind, "udp4") == 0 || strcmp(kind, "udp") == 0);
+    int get_udp6 = (kind == NULL || strcmp(kind, "inet") == 0 || strcmp(kind, "udp6") == 0 || strcmp(kind, "udp") == 0);
+    
     int capacity = 64;
     psutil_net_connection* proc_connections = (psutil_net_connection*)malloc(capacity * sizeof(psutil_net_connection));
     if (proc_connections == NULL) {
-        free(all_connections);
         *count = 0;
         return NULL;
     }
     
     int index = 0;
-    for (int i = 0; i < *count; i++) {
-        // Note: The psutil_net_connection structure doesn't have a pid field
-        // In a real implementation, we would need to modify the structure to include pid
-        // For now, we'll return all connections
-        if (index >= capacity) {
-            capacity *= 2;
-            psutil_net_connection* new_conn = (psutil_net_connection*)realloc(proc_connections, capacity * sizeof(psutil_net_connection));
-            if (new_conn == NULL) {
-                free(proc_connections);
-                free(all_connections);
-                *count = 0;
-                return NULL;
-            }
-            proc_connections = new_conn;
-        }
-        proc_connections[index++] = all_connections[i];
+    
+    if (get_tcp) {
+        index = read_proc_net_tcp("/proc/net/tcp", AF_INET, proc_connections, capacity, index, inodes, inode_count);
+    }
+    if (get_tcp6 && index < capacity) {
+        index = read_proc_net_tcp("/proc/net/tcp6", AF_INET6, proc_connections, capacity, index, inodes, inode_count);
+    }
+    if (get_udp && index < capacity) {
+        index = read_proc_net_udp("/proc/net/udp", AF_INET, proc_connections, capacity, index, inodes, inode_count);
+    }
+    if (get_udp6 && index < capacity) {
+        index = read_proc_net_udp("/proc/net/udp6", AF_INET6, proc_connections, capacity, index, inodes, inode_count);
     }
     
-    free(all_connections);
     *count = index;
     if (index == 0) {
         free(proc_connections);
@@ -1269,8 +1331,8 @@ int psutil_linux_process_wait(Process* proc, double timeout) {
         int interval = 10; // Check every 10ms
         
         while (elapsed < timeout_ms) {
-            result = waitpid(proc->pid, &status, WNOHANG);
-            if (result == proc->pid) {
+            result = waitpid((pid_t)proc->pid, &status, WNOHANG);
+            if (result == (pid_t)proc->pid) {
                 return 0;  // Process exited
             } else if (result == -1) {
                 return -1; // Error
@@ -1281,7 +1343,7 @@ int psutil_linux_process_wait(Process* proc, double timeout) {
         return 1; // Timeout
     }
     
-    if (result == proc->pid) {
+    if (result == (pid_t)proc->pid) {
         return 0;
     } else if (result == -1) {
         return -1;
@@ -1361,6 +1423,7 @@ psutil_memory_info psutil_linux_swap_memory(void) {
 }
 
 psutil_cpu_times psutil_linux_cpu_times(int percpu) {
+    (void)percpu;
     psutil_cpu_times times = {0};
     FILE *fp = fopen("/proc/stat", "r");
     if (fp != NULL) {
@@ -1473,13 +1536,11 @@ psutil_cpu_stats psutil_linux_cpu_stats(void) {
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "ctxt", 4) == 0) {
-            sscanf(line, "ctxt %d", &stats.ctx_switches);
+            sscanf(line, "ctxt %" SCNu64, &stats.ctx_switches);
         } else if (strncmp(line, "intr", 4) == 0) {
-            sscanf(line, "intr %d", &stats.interrupts);
+            sscanf(line, "intr %" SCNu64, &stats.interrupts);
         } else if (strncmp(line, "softirq", 7) == 0) {
-            // Soft interrupts are in the second field
-            int dummy;
-            sscanf(line, "softirq %d %d", &dummy, &stats.soft_interrupts);
+            sscanf(line, "softirq %" SCNu64, &stats.soft_interrupts);
         }
     }
     
@@ -1488,6 +1549,7 @@ psutil_cpu_stats psutil_linux_cpu_stats(void) {
 }
 
 psutil_io_counters psutil_linux_net_io_counters(int pernic) {
+    (void)pernic;
     psutil_io_counters counters = {0};
 
     FILE* fp = fopen("/proc/net/dev", "r");
@@ -1532,19 +1594,19 @@ psutil_io_counters psutil_linux_net_io_counters(int pernic) {
 }
 
 // Helper function to parse TCP state from /proc/net/tcp
-static int parse_tcp_state(char state) {
+static int parse_tcp_state(int state) {
     switch (state) {
-        case '0': return CONN_ESTABLISHED;
-        case '1': return CONN_SYN_SENT;
-        case '2': return CONN_SYN_RECV;
-        case '3': return CONN_FIN_WAIT1;
-        case '4': return CONN_FIN_WAIT2;
-        case '5': return CONN_TIME_WAIT;
-        case '6': return CONN_CLOSE;
-        case '7': return CONN_CLOSE_WAIT;
-        case '8': return CONN_LAST_ACK;
-        case '9': return CONN_LISTEN;
-        case 'A': return CONN_CLOSING;
+        case 0x1: return CONN_ESTABLISHED;
+        case 0x2: return CONN_SYN_SENT;
+        case 0x3: return CONN_SYN_RECV;
+        case 0x4: return CONN_FIN_WAIT1;
+        case 0x5: return CONN_FIN_WAIT2;
+        case 0x6: return CONN_TIME_WAIT;
+        case 0x7: return CONN_CLOSE;
+        case 0x8: return CONN_CLOSE_WAIT;
+        case 0x9: return CONN_LAST_ACK;
+        case 0xA: return CONN_LISTEN;
+        case 0xB: return CONN_CLOSING;
         default: return CONN_NONE;
     }
 }
@@ -1556,8 +1618,45 @@ static void parse_proc_net_addr(char* buf, size_t buf_size, unsigned int addr, u
     snprintf(buf, buf_size, "%s:%d", inet_ntoa(inaddr), port);
 }
 
-// Helper function to read connections from /proc/net/tcp or /proc/net/tcp6
-static int read_proc_net_tcp(const char* path, int family, psutil_net_connection* connections, int max_count, int offset) {
+// Helper function to collect the socket inodes opened by a process.
+// Returns the number of inodes found, or -1 on failure.
+static int collect_socket_inodes(pid_t pid, unsigned long* inodes, int max_inodes) {
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/fd", pid);
+    DIR* dir = opendir(path);
+    if (dir == NULL) {
+        return -1;
+    }
+
+    int count = 0;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL && count < max_inodes) {
+        char link_path[512];
+        char target[128];
+        snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%s", pid, entry->d_name);
+        ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+        if (len <= 0) {
+            continue;
+        }
+        target[len] = '\0';
+        // Symbolic links to sockets look like "socket:[123456]"
+        if (strncmp(target, "socket:[", 8) == 0) {
+            char* close_bracket = strchr(target + 8, ']');
+            if (close_bracket != NULL) {
+                *close_bracket = '\0';
+                inodes[count++] = (unsigned long)strtoul(target + 8, NULL, 10);
+            }
+        }
+    }
+
+    closedir(dir);
+    return count;
+}
+
+// Helper function to read TCP connections from /proc/net/tcp or /proc/net/tcp6.
+// If pid_filter is non-NULL, only connections whose inode is listed are kept.
+static int read_proc_net_tcp(const char* path, int family, psutil_net_connection* connections, int max_count, int offset,
+                             const unsigned long* pid_filter, int pid_filter_count) {
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
         return offset;
@@ -1577,12 +1676,25 @@ static int read_proc_net_tcp(const char* path, int family, psutil_net_connection
         if (sscanf(line, "%d: %08X:%04X %08X:%04X %02X %08X:%08X %02X:%08X %08X %d",
                    &num, &local_addr, &local_port, &rem_addr, &rem_port, &state,
                    &inode, &uid, &num, &num, &num, &num) >= 6) {
+            if (pid_filter != NULL) {
+                // Keep only connections owned by this process
+                int found = 0;
+                for (int i = 0; i < pid_filter_count; i++) {
+                    if (pid_filter[i] == (unsigned long)inode) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    continue;
+                }
+            }
             connections[index].fd = -1;
             connections[index].family = family;
             connections[index].type = SOCK_STREAM;
             parse_proc_net_addr(connections[index].laddr, sizeof(connections[index].laddr), local_addr, local_port);
             parse_proc_net_addr(connections[index].raddr, sizeof(connections[index].raddr), rem_addr, rem_port);
-            connections[index].status = parse_tcp_state('0' + state);
+            connections[index].status = parse_tcp_state(state);
             index++;
         }
     }
@@ -1591,8 +1703,10 @@ static int read_proc_net_tcp(const char* path, int family, psutil_net_connection
     return index;
 }
 
-// Helper function to read UDP connections from /proc/net/udp or /proc/net/udp6
-static int read_proc_net_udp(const char* path, int family, psutil_net_connection* connections, int max_count, int offset) {
+// Helper function to read UDP connections from /proc/net/udp or /proc/net/udp6.
+// If pid_filter is non-NULL, only connections whose inode is listed are kept.
+static int read_proc_net_udp(const char* path, int family, psutil_net_connection* connections, int max_count, int offset,
+                             const unsigned long* pid_filter, int pid_filter_count) {
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
         return offset;
@@ -1612,6 +1726,19 @@ static int read_proc_net_udp(const char* path, int family, psutil_net_connection
         if (sscanf(line, "%d: %08X:%04X %08X:%04X %02X %08X:%08X %02X:%08X %08X %d",
                    &num, &local_addr, &local_port, &rem_addr, &rem_port, &num,
                    &inode, &uid, &num, &num, &num, &num) >= 4) {
+            if (pid_filter != NULL) {
+                // Keep only connections owned by this process
+                int found = 0;
+                for (int i = 0; i < pid_filter_count; i++) {
+                    if (pid_filter[i] == (unsigned long)inode) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    continue;
+                }
+            }
             connections[index].fd = -1;
             connections[index].family = family;
             connections[index].type = SOCK_DGRAM;
@@ -1645,22 +1772,22 @@ psutil_net_connection* psutil_linux_net_connections(const char* kind, int* count
 
     // Get TCP IPv4 connections
     if (get_tcp) {
-        index = read_proc_net_tcp("/proc/net/tcp", AF_INET, connections, capacity, index);
+        index = read_proc_net_tcp("/proc/net/tcp", AF_INET, connections, capacity, index, NULL, 0);
     }
 
     // Get TCP IPv6 connections
     if (get_tcp6 && index < capacity) {
-        index = read_proc_net_tcp("/proc/net/tcp6", AF_INET6, connections, capacity, index);
+        index = read_proc_net_tcp("/proc/net/tcp6", AF_INET6, connections, capacity, index, NULL, 0);
     }
 
     // Get UDP IPv4 connections
     if (get_udp && index < capacity) {
-        index = read_proc_net_udp("/proc/net/udp", AF_INET, connections, capacity, index);
+        index = read_proc_net_udp("/proc/net/udp", AF_INET, connections, capacity, index, NULL, 0);
     }
 
     // Get UDP IPv6 connections
     if (get_udp6 && index < capacity) {
-        index = read_proc_net_udp("/proc/net/udp6", AF_INET6, connections, capacity, index);
+        index = read_proc_net_udp("/proc/net/udp6", AF_INET6, connections, capacity, index, NULL, 0);
     }
 
     *count = index;
@@ -1745,10 +1872,6 @@ psutil_net_if_addr* psutil_linux_net_if_addrs(int* count) {
 }
 
 psutil_net_if_stat* psutil_linux_net_if_stats(int* count) {
-    // Get list of interfaces from net_io_counters
-    psutil_io_counters* io_counters = NULL;
-    int io_count = 0;
-    
     // First, get list of interface names from /proc/net/dev
     FILE* fp = fopen("/proc/net/dev", "r");
     if (fp == NULL) {
@@ -1818,7 +1941,7 @@ psutil_net_if_stat* psutil_linux_net_if_stats(int* count) {
         }
         
         // Get speed and duplex from /sys/class/net/<name>/
-        char speed_path[256];
+        char speed_path[640];
         snprintf(speed_path, sizeof(speed_path), "/sys/class/net/%s/speed", name);
         FILE* speed_fp = fopen(speed_path, "r");
         if (speed_fp != NULL) {
@@ -1830,18 +1953,18 @@ psutil_net_if_stat* psutil_linux_net_if_stats(int* count) {
         }
         
         // Duplex - default to unknown
-        stats[index].duplex = 0;  // DUPLEX_UNKNOWN
+        stats[index].duplex = NIC_DUPLEX_UNKNOWN;
         
-        char duplex_path[256];
+        char duplex_path[640];
         snprintf(duplex_path, sizeof(duplex_path), "/sys/class/net/%s/duplex", name);
         FILE* duplex_fp = fopen(duplex_path, "r");
         if (duplex_fp != NULL) {
             char duplex[32];
             if (fscanf(duplex_fp, "%s", duplex) == 1) {
                 if (strcmp(duplex, "full") == 0) {
-                    stats[index].duplex = 2;  // DUPLEX_FULL
+                    stats[index].duplex = NIC_DUPLEX_FULL;
                 } else if (strcmp(duplex, "half") == 0) {
-                    stats[index].duplex = 1;  // DUPLEX_HALF
+                    stats[index].duplex = NIC_DUPLEX_HALF;
                 }
             }
             fclose(duplex_fp);
@@ -1857,6 +1980,7 @@ psutil_net_if_stat* psutil_linux_net_if_stats(int* count) {
 }
 
 psutil_io_counters psutil_linux_disk_io_counters(int perdisk) {
+    (void)perdisk;
     psutil_io_counters counters = {0};
 
     FILE* fp = fopen("/proc/diskstats", "r");
@@ -2009,7 +2133,9 @@ psutil_disk_usage psutil_linux_disk_usage(const char* path) {
         usage.total = (uint64_t)sfs.f_blocks * sfs.f_bsize;
         usage.free = (uint64_t)sfs.f_bavail * sfs.f_bsize;
         usage.used = usage.total - usage.free;
-        usage.percent = (double)usage.used / usage.total * 100.0;
+        if (usage.total > 0) {
+            usage.percent = (double)usage.used / usage.total * 100.0;
+        }
     }
     return usage;
 }
@@ -2046,11 +2172,11 @@ psutil_user* psutil_linux_users(int* count) {
         }
 
         // Copy username
-        strncpy(users[index].name, ut->ut_user, sizeof(users[index].name) - 1);
+        memcpy(users[index].name, ut->ut_user, sizeof(users[index].name) - 1);
         users[index].name[sizeof(users[index].name) - 1] = '\0';
 
         // Copy terminal
-        strncpy(users[index].terminal, ut->ut_line, sizeof(users[index].terminal) - 1);
+        memcpy(users[index].terminal, ut->ut_line, sizeof(users[index].terminal) - 1);
         users[index].terminal[sizeof(users[index].terminal) - 1] = '\0';
 
         // Copy host

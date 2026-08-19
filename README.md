@@ -178,8 +178,8 @@ int main() {
         return 1;
     }
 
-    // 获取当前进程
-    Process* proc = process_new(getpid());
+    // 获取当前进程（pid=0 表示当前进程）
+    Process* proc = process_new(0);
     if (proc) {
         printf("Process name: %s\n", process_get_name(proc));
         printf("Process exe: %s\n", process_get_exe(proc));
@@ -188,12 +188,12 @@ int main() {
 
     // 获取系统内存信息
     psutil_memory_info mem = virtual_memory();
-    printf("Total memory: %llu bytes\n", mem.total);
-    printf("Available memory: %llu bytes\n", mem.available);
+    printf("Total memory: %llu bytes\n", mem.vms);
+    printf("Used memory: %llu bytes\n", mem.rss);
 
     // 获取 CPU 数量
-    int cpu_count = cpu_count(1); // 1 = 逻辑核心
-    printf("CPU count: %d\n", cpu_count);
+    int num_cpus = cpu_count(1); // 1 = 逻辑核心
+    printf("CPU count: %d\n", num_cpus);
 
     // 清理
     psutil_cleanup();
@@ -210,6 +210,7 @@ int main() {
 | 函数 | 说明 | 返回值 |
 |------|------|--------|
 | `int psutil_init(void)` | 初始化 psutil 库 | 0 表示成功，非 0 表示失败 |
+| `void psutil_cleanup(void)` | 清理 psutil 库资源 | 无 |
 
 ### 进程操作
 

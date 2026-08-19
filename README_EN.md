@@ -177,8 +177,8 @@ int main() {
         return 1;
     }
 
-    // Get current process
-    Process* proc = process_new(getpid());
+    // Get current process (pid=0 means current process)
+    Process* proc = process_new(0);
     if (proc) {
         printf("Process name: %s\n", process_get_name(proc));
         printf("Process exe: %s\n", process_get_exe(proc));
@@ -187,12 +187,12 @@ int main() {
 
     // Get system memory info
     psutil_memory_info mem = virtual_memory();
-    printf("Total memory: %llu bytes\n", mem.total);
-    printf("Available memory: %llu bytes\n", mem.available);
+    printf("Total memory: %llu bytes\n", mem.vms);
+    printf("Used memory: %llu bytes\n", mem.rss);
 
     // Get CPU count
-    int cpu_count = cpu_count(1); // 1 = logical cores
-    printf("CPU count: %d\n", cpu_count);
+    int num_cpus = cpu_count(1); // 1 = logical cores
+    printf("CPU count: %d\n", num_cpus);
 
     // Cleanup
     psutil_cleanup();
@@ -209,6 +209,7 @@ For more detailed examples, please refer to the `example.c` file.
 | Function | Description | Return Value |
 |----------|-------------|--------------|
 | `int psutil_init(void)` | Initialize psutil library | 0 for success, non-zero for failure |
+| `void psutil_cleanup(void)` | Cleanup psutil library resources | None |
 
 ### Process Operations
 

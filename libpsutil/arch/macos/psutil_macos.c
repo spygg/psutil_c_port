@@ -31,6 +31,7 @@
 #include <ifaddrs.h>
 #include <libproc.h>
 #include <mach/mach.h>
+#include <mach/thread_info.h>
 #include <mach/task.h>
 #include <mach/mach_init.h>
 #include <mach/mach_traps.h>
@@ -55,7 +56,7 @@ int psutil_macos_init(void) {
 }
 
 // Process functions
-int psutil_macos_pid_exists(pid_t pid) {
+int psutil_macos_pid_exists(psutil_pid_t pid) {
     if (pid < 0) {
         return 0;
     }
@@ -70,10 +71,10 @@ int psutil_macos_pid_exists(pid_t pid) {
     return 0;
 }
 
-pid_t* psutil_macos_pids(int *count) {
+psutil_pid_t* psutil_macos_pids(int *count) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t size;
-    pid_t *pids = NULL;
+    psutil_pid_t *pids = NULL;
     struct kinfo_proc *procs = NULL;
     
     // Get the size needed
@@ -96,7 +97,7 @@ pid_t* psutil_macos_pids(int *count) {
     }
     
     int num_procs = size / sizeof(struct kinfo_proc);
-    pids = (pid_t*)malloc(num_procs * sizeof(pid_t));
+    pids = (psutil_pid_t*)malloc(num_procs * sizeof(psutil_pid_t));
     if (pids == NULL) {
         free(procs);
         *count = 0;
@@ -114,7 +115,7 @@ pid_t* psutil_macos_pids(int *count) {
 
 #include <unistd.h>
 
-Process* psutil_macos_process_new(pid_t pid) {
+Process* psutil_macos_process_new(psutil_pid_t pid) {
     Process* proc = (Process*)malloc(sizeof(Process));
     if (proc == NULL) {
         return NULL;
@@ -158,7 +159,7 @@ void psutil_macos_process_free(Process* proc) {
     free(proc);
 }
 
-pid_t psutil_macos_process_get_ppid(Process* proc) {
+psutil_pid_t psutil_macos_process_get_ppid(Process* proc) {
     if (proc == NULL) {
         return 0;
     }
@@ -217,7 +218,7 @@ char** psutil_macos_process_get_cmdline(Process* proc, int* count) {
         return NULL;
     }
     
-    // Get the command line arguments using proc_pidinfo
+    // Get the command line arguments using KERN_PROCARGS2
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, proc->pid };
     size_t size = 0;
     
@@ -238,55 +239,62 @@ char** psutil_macos_process_get_cmdline(Process* proc, int* count) {
         return NULL;
     }
     
-    // Parse arguments
-    char **argv = NULL;
-    int argc = 0;
-    char *p = buf;
+    // The first int is argc
+    if (size < (size_t)sizeof(int)) {
+        free(buf);
+        *count = 0;
+        return NULL;
+    }
+    int argc = *(int*)buf;
     
     // Skip argc
-    p += sizeof(int);
+    char *p = buf + sizeof(int);
+    char *end = buf + size;
     
-    // Skip exec_path
-    while (p < buf + size && *p != '\0') p++;
-    p++;
+    // Skip exec_path (NUL terminated)
+    while (p < end && *p != '\0') p++;
+    if (p < end) p++;
     
-    // Skip nulls
-    while (p < buf + size && *p == '\0') p++;
+    // Skip padding NULs up to the first argument
+    while (p < end && *p == '\0') p++;
     
-    // Count arguments
-    char *start = p;
-    while (p < buf + size && *p != '\0') {
-        if (*p == '\0') {
-            argc++;
-        }
-        p++;
-    }
-    
-    if (argc == 0) {
+    if (argc <= 0) {
         free(buf);
         *count = 0;
         return NULL;
     }
     
-    argv = (char**)malloc((argc + 1) * sizeof(char*));
+    char **argv = (char**)malloc((argc + 1) * sizeof(char*));
     if (argv == NULL) {
         free(buf);
         *count = 0;
         return NULL;
     }
     
-    // Copy arguments
-    p = start;
+    // Copy argc arguments (NUL separated)
     int i = 0;
-    while (p < buf + size && i < argc) {
+    while (p < end && i < argc) {
         argv[i] = strdup(p);
+        if (argv[i] == NULL) {
+            for (int j = 0; j < i; j++) {
+                free(argv[j]);
+            }
+            free(argv);
+            free(buf);
+            *count = 0;
+            return NULL;
+        }
         p += strlen(p) + 1;
         i++;
     }
     argv[i] = NULL;
     
     free(buf);
-    *count = argc;
+    *count = i;
+    if (i == 0) {
+        free(argv);
+        return NULL;
+    }
     return argv;
 }
 
@@ -458,18 +466,12 @@ int psutil_macos_process_get_num_fds(Process* proc) {
         return 0;
     }
 
+    // macOS: use proc_pidinfo with PROC_PIDLISTFDS to enumerate file descriptors.
+    // First call with NULL buffer to get the required buffer size.
     int num_fds = 0;
-    int mib[3];
-    size_t len;
-
-    // Get the size needed for the file descriptor list
-    mib[0] = CTL_KERN;
-    mib[1] = KERN_PROC;
-    mib[2] = KERN_PROC_NFDS;
-    mib[3] = proc->pid;
-
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) == 0) {
-        num_fds = len / sizeof(int);
+    int ret = proc_pidinfo(proc->pid, PROC_PIDLISTFDS, 0, NULL, 0);
+    if (ret > 0) {
+        num_fds = ret / sizeof(struct proc_fdinfo);
     }
 
     return num_fds;
@@ -572,13 +574,16 @@ int psutil_macos_process_get_cpu_num(Process* proc) {
         return -1;
     }
     
-    // On macOS, we can use sched_getcpu() to get the current CPU
-    int cpu_num = sched_getcpu();
-    if (cpu_num < 0) {
-        return -1;
+    // macOS has no sched_getcpu(); use THREAD_IDENTIFIER_INFO to get the
+    // processor id of the calling thread.
+    thread_identifier_info_data_t tident;
+    mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
+    if (thread_info(mach_thread_self(), THREAD_IDENTIFIER_INFO,
+                    (thread_info_t)&tident, &count) == KERN_SUCCESS) {
+        return (int)tident.thread_handle;
     }
     
-    return cpu_num;
+    return -1;
 }
 
 char** psutil_macos_process_get_environ(Process* proc, int* count) {
@@ -955,9 +960,9 @@ psutil_memory_info psutil_macos_swap_memory(void) {
     int mib[2] = {CTL_VM, VM_SWAPUSAGE};
     
     if (sysctl(mib, 2, &swap_usage, &len, NULL, 0) == 0) {
-        info.total = swap_usage.xsu_total;
-        info.used = swap_usage.xsu_used;
-        info.free = swap_usage.xsu_avail;
+        info.vms = swap_usage.xsu_total;
+        info.rss = swap_usage.xsu_used;
+        info.shared = swap_usage.xsu_avail;
     }
     
     return info;
@@ -1114,14 +1119,10 @@ psutil_io_counters psutil_macos_net_io_counters(int pernic) {
         
         if (ifm->ifm_type == RTM_IFINFO2) {
             struct if_msghdr2 *ifm2 = (struct if_msghdr2 *)ifm;
-            counters.bytes_sent += ifm2->ifm_data.ifi_obytes;
-            counters.bytes_recv += ifm2->ifm_data.ifi_ibytes;
-            counters.packets_sent += ifm2->ifm_data.ifi_opackets;
-            counters.packets_recv += ifm2->ifm_data.ifi_ipackets;
-            counters.errin += ifm2->ifm_data.ifi_ierrors;
-            counters.errout += ifm2->ifm_data.ifi_oerrors;
-            counters.dropin += ifm2->ifm_data.ifi_iqdrops;
-            // Note: dropout not available in ifm_data
+            counters.read_bytes += ifm2->ifm_data.ifi_ibytes;
+            counters.write_bytes += ifm2->ifm_data.ifi_obytes;
+            counters.read_count += ifm2->ifm_data.ifi_ipackets;
+            counters.write_count += ifm2->ifm_data.ifi_opackets;
         }
         
         ptr += ifm->ifm_msglen;
@@ -1298,7 +1299,7 @@ psutil_net_if_addr* psutil_macos_net_if_addrs(int* count) {
         return NULL;
     }
     
-    psutil_net_if_addr* addrs = (psutil_net_if_addr*)malloc(num_addrs * sizeof(psutil_net_if_addr));
+    psutil_net_if_addr* addrs = (psutil_net_if_addr*)calloc(num_addrs, sizeof(psutil_net_if_addr));
     if (addrs == NULL) {
         freeifaddrs(ifap);
         return NULL;
@@ -1406,11 +1407,16 @@ psutil_net_if_stat* psutil_macos_net_if_stats(int* count) {
             struct sockaddr_dl *sdl = (struct sockaddr_dl *)((char *)ifm + ifm->ifm_hdrlen);
             
             if (sdl->sdl_family == AF_LINK && sdl->sdl_nlen > 0) {
-                strncpy(stats[index].interface, sdl->sdl_data, sdl->sdl_nlen);
-                stats[index].interface[sdl->sdl_nlen] = '\0';
+                size_t nlen = sdl->sdl_nlen;
+                if (nlen >= sizeof(stats[index].name)) {
+                    nlen = sizeof(stats[index].name) - 1;
+                }
+                memcpy(stats[index].name, sdl->sdl_data, nlen);
+                stats[index].name[nlen] = '\0';
                 stats[index].isup = (ifm2->ifm_data.ifi_flags & IFF_UP) ? 1 : 0;
-                stats[index].speed = ifm2->ifm_data.ifi_baudrate;
+                stats[index].speed = (int)(ifm2->ifm_data.ifi_baudrate / 1000000);
                 stats[index].mtu = ifm2->ifm_data.ifi_mtu;
+                stats[index].duplex = NIC_DUPLEX_UNKNOWN;
                 index++;
             }
         }
@@ -1423,22 +1429,12 @@ psutil_net_if_stat* psutil_macos_net_if_stats(int* count) {
 }
 
 psutil_io_counters psutil_macos_disk_io_counters(int perdisk) {
+    (void)perdisk;
     psutil_io_counters counters = {0};
 
-    // Get disk statistics using IOKit framework
-    // For now, return zeros as IOKit requires more complex implementation
-    // This is a simplified version
-
-    int mib[2] = {CTL_HW, HW_DISKSTATS};
-    struct diskstats stats;
-    size_t len = sizeof(stats);
-
-    if (sysctl(mib, 2, &stats, &len, NULL, 0) == 0) {
-        counters.read_count = stats.ds_rxfer;
-        counters.write_count = stats.ds_wxfer;
-        counters.read_bytes = stats.ds_rbytes;
-        counters.write_bytes = stats.ds_wbytes;
-    }
+    // macOS: HW_DISKSTATS does not exist. A full implementation would use
+    // IOKit's IOBlockStorageDriver statistics; this simplified version
+    // returns zeros.
 
     return counters;
 }
@@ -1534,7 +1530,9 @@ psutil_disk_usage psutil_macos_disk_usage(const char* path) {
         usage.total = (uint64_t)sfs.f_blocks * sfs.f_bsize;
         usage.free = (uint64_t)sfs.f_bavail * sfs.f_bsize;
         usage.used = usage.total - usage.free;
-        usage.percent = (double)usage.used / usage.total * 100.0;
+        if (usage.total > 0) {
+            usage.percent = (double)usage.used / usage.total * 100.0;
+        }
     }
     return usage;
 }

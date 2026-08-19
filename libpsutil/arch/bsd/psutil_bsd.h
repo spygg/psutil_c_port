@@ -7,6 +7,8 @@
 #ifndef PSUTIL_BSD_H
 #define PSUTIL_BSD_H
 
+#include "../../psutil.h"
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -29,11 +31,11 @@
 int psutil_bsd_init(void);
 
 // Process functions
-int psutil_bsd_pid_exists(pid_t pid);
-pid_t* psutil_bsd_pids(int *count);
-Process* psutil_bsd_process_new(pid_t pid);
+int psutil_bsd_pid_exists(psutil_pid_t pid);
+psutil_pid_t* psutil_bsd_pids(int *count);
+Process* psutil_bsd_process_new(psutil_pid_t pid);
 void psutil_bsd_process_free(Process* proc);
-pid_t psutil_bsd_process_get_ppid(Process* proc);
+psutil_pid_t psutil_bsd_process_get_ppid(Process* proc);
 const char* psutil_bsd_process_get_name(Process* proc);
 const char* psutil_bsd_process_get_exe(Process* proc);
 char** psutil_bsd_process_get_cmdline(Process* proc, int* count);

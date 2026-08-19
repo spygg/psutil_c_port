@@ -7,6 +7,8 @@
 #ifndef PSUTIL_ANDROID_H
 #define PSUTIL_ANDROID_H
 
+#include "../../psutil.h"
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -33,11 +35,11 @@
 int psutil_android_init(void);
 
 // Process functions
-int psutil_android_pid_exists(pid_t pid);
-pid_t* psutil_android_pids(int *count);
-Process* psutil_android_process_new(pid_t pid);
+int psutil_android_pid_exists(psutil_pid_t pid);
+psutil_pid_t* psutil_android_pids(int *count);
+Process* psutil_android_process_new(psutil_pid_t pid);
 void psutil_android_process_free(Process* proc);
-pid_t psutil_android_process_get_ppid(Process* proc);
+psutil_pid_t psutil_android_process_get_ppid(Process* proc);
 const char* psutil_android_process_get_name(Process* proc);
 const char* psutil_android_process_get_exe(Process* proc);
 char** psutil_android_process_get_cmdline(Process* proc, int* count);

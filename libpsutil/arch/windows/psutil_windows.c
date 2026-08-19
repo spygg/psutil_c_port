@@ -10,6 +10,7 @@
 #include <time.h>
 #include <winsock2.h>
 #include <windows.h>
+#include <WS2tcpip.h>
 #include <psapi.h>
 #include <iphlpapi.h>
 #include <iprtrmib.h>
@@ -39,6 +40,11 @@ PWTSEnumerateSessionsW g_WTSEnumerateSessionsW;
 PWTSQuerySessionInformationW g_WTSQuerySessionInformationW;
 PWTSFreeMemory g_WTSFreeMemory;
 PGetTickCount64 g_GetTickCount64;
+PGetCurrentProcessorNumber g_GetCurrentProcessorNumber;
+PGetProcessHandleCount g_GetProcessHandleCount;
+PGetExtendedTcpTable g_GetExtendedTcpTable;
+PGetExtendedUdpTable g_GetExtendedUdpTable;
+PGetAdaptersAddresses g_GetAdaptersAddresses;
 
 // Initialize the library
 int psutil_windows_init(void) {
@@ -52,9 +58,6 @@ int psutil_windows_init(void) {
     
     // Get system information
     GetSystemInfo(&PSUTIL_SYSTEM_INFO);
-    
-    // Print system information for debugging
-    printf("System info: number of processors = %d\n", PSUTIL_SYSTEM_INFO.dwNumberOfProcessors);
     
     return 0;
 }
@@ -97,7 +100,7 @@ PVOID psutil_SetFromNTStatusErr(NTSTATUS Status, const char *syscall) {
 }
 
 int psutil_loadlibs(void) {
-    // --- Mandatory
+    // --- Mandatory (available since Windows XP)
     g_NtQuerySystemInformation = psutil_GetProcAddressFromLib(
         "ntdll.dll", "NtQuerySystemInformation");
     if (!g_NtQuerySystemInformation)
@@ -114,45 +117,46 @@ int psutil_loadlibs(void) {
         "ntdll.dll", "NtQueryObject");
     if (!g_NtQueryObject)
         return 1;
-    g_RtlIpv4AddressToStringA = psutil_GetProcAddressFromLib(
-        "ntdll.dll", "RtlIpv4AddressToStringA");
-    if (!g_RtlIpv4AddressToStringA)
-        return 1;
     g_RtlGetVersion = psutil_GetProcAddressFromLib(
         "ntdll.dll", "RtlGetVersion");
     if (!g_RtlGetVersion)
         return 1;
-    g_NtSuspendProcess = psutil_GetProcAddressFromLib(
-        "ntdll", "NtSuspendProcess");
-    if (!g_NtSuspendProcess)
-        return 1;
-    g_NtResumeProcess = psutil_GetProcAddressFromLib(
-        "ntdll", "NtResumeProcess");
-    if (!g_NtResumeProcess)
-        return 1;
-    g_NtQueryVirtualMemory = psutil_GetProcAddressFromLib(
-        "ntdll", "NtQueryVirtualMemory");
-    if (!g_NtQueryVirtualMemory)
-        return 1;
-    g_RtlNtStatusToDosErrorNoTeb = psutil_GetProcAddressFromLib(
-        "ntdll", "RtlNtStatusToDosErrorNoTeb");
-    if (!g_RtlNtStatusToDosErrorNoTeb)
-        return 1;
-    // GetTickCount64 is optional (Windows Vista+)
-    g_GetTickCount64 = psutil_GetProcAddress(
-        "kernel32", "GetTickCount64");
-    // RtlIpv6AddressToStringA is optional (Windows Vista+)
+
+    // --- Optional (Vista+ / Win7+). Missing entries stay NULL and
+    //     callers must check before use, so XP keeps working.
+    // Vista+
+    g_RtlIpv4AddressToStringA = psutil_GetProcAddressFromLib(
+        "ntdll.dll", "RtlIpv4AddressToStringA");
     g_RtlIpv6AddressToStringA = psutil_GetProcAddressFromLib(
         "ntdll.dll", "RtlIpv6AddressToStringA");
-
-    // --- Optional
-    // minimum requirement: Win 7
+    g_NtSuspendProcess = psutil_GetProcAddressFromLib(
+        "ntdll", "NtSuspendProcess");
+    g_NtResumeProcess = psutil_GetProcAddressFromLib(
+        "ntdll", "NtResumeProcess");
+    g_NtQueryVirtualMemory = psutil_GetProcAddressFromLib(
+        "ntdll", "NtQueryVirtualMemory");
+    g_RtlNtStatusToDosErrorNoTeb = psutil_GetProcAddressFromLib(
+        "ntdll", "RtlNtStatusToDosErrorNoTeb");
+    g_GetTickCount64 = psutil_GetProcAddress(
+        "kernel32", "GetTickCount64");
+    // Vista+
+    g_GetCurrentProcessorNumber = psutil_GetProcAddress(
+        "kernel32", "GetCurrentProcessorNumber");
+    g_GetProcessHandleCount = psutil_GetProcAddress(
+        "kernel32", "GetProcessHandleCount");
+    // IPHLPAPI functions (need XP SP2+; load dynamically for XP RTM/SP1)
+    g_GetExtendedTcpTable = psutil_GetProcAddressFromLib(
+        "iphlpapi.dll", "GetExtendedTcpTable");
+    g_GetExtendedUdpTable = psutil_GetProcAddressFromLib(
+        "iphlpapi.dll", "GetExtendedUdpTable");
+    g_GetAdaptersAddresses = psutil_GetProcAddressFromLib(
+        "iphlpapi.dll", "GetAdaptersAddresses");
+    // Win7+
     g_GetActiveProcessorCount = psutil_GetProcAddress(
         "kernel32", "GetActiveProcessorCount");
-    // minimum requirement: Win 7
     g_GetLogicalProcessorInformationEx = psutil_GetProcAddressFromLib(
         "kernel32", "GetLogicalProcessorInformationEx");
-    // minimum requirements: Windows Server Core
+    // WTS (Windows Server Core etc.)
     g_WTSEnumerateSessionsW = psutil_GetProcAddressFromLib(
         "wtsapi32.dll", "WTSEnumerateSessionsW");
     g_WTSQuerySessionInformationW = psutil_GetProcAddressFromLib(
@@ -215,16 +219,19 @@ double psutil_LargeIntegerToUnixTime(LARGE_INTEGER li) {
 }
 
 // Process functions
-int psutil_windows_pid_exists(DWORD pid) {
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+int psutil_windows_pid_exists(psutil_pid_t pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, (DWORD)pid);
     if (hProcess != NULL) {
         CloseHandle(hProcess);
+        return 1;
+    }
+    if (GetLastError() == ERROR_ACCESS_DENIED) {
         return 1;
     }
     return 0;
 }
 
-uint32_t* psutil_windows_pids(int *count) {
+psutil_pid_t* psutil_windows_pids(int *count) {
     DWORD *pids = NULL;
     DWORD size = 1024;
     DWORD needed;
@@ -241,11 +248,28 @@ uint32_t* psutil_windows_pids(int *count) {
         return NULL;
     }
 
+    // If the buffer was too small, retry with the required size
+    if (needed > size * sizeof(DWORD)) {
+        size = needed / sizeof(DWORD);
+        DWORD *new_pids = (DWORD*)realloc(pids, needed);
+        if (new_pids == NULL) {
+            free(pids);
+            *count = 0;
+            return NULL;
+        }
+        pids = new_pids;
+        if (!EnumProcesses(pids, needed, &needed)) {
+            free(pids);
+            *count = 0;
+            return NULL;
+        }
+    }
+
     *count = needed / sizeof(DWORD);
-    return (uint32_t*)pids;
+    return (psutil_pid_t*)pids;
 }
 
-Process* psutil_windows_process_new(DWORD pid) {
+Process* psutil_windows_process_new(psutil_pid_t pid) {
     Process* proc = (Process*)malloc(sizeof(Process));
     if (proc == NULL) {
         return NULL;
@@ -253,7 +277,7 @@ Process* psutil_windows_process_new(DWORD pid) {
 
     // If pid is 0, use current process PID
     if (pid == 0) {
-        pid = GetCurrentProcessId();
+        pid = (psutil_pid_t)GetCurrentProcessId();
     }
 
     proc->pid = pid;
@@ -296,17 +320,40 @@ void psutil_windows_process_free(Process* proc) {
     free(proc);
 }
 
-DWORD psutil_windows_process_get_ppid(Process* proc) {
+psutil_pid_t psutil_windows_process_get_ppid(Process* proc) {
     if (proc == NULL) {
         return 0;
     }
-    
+
     if (proc->ppid > 0) {
         return proc->ppid;
     }
-    
-    // For now, return a placeholder value
-    proc->ppid = 1;
+
+    if (g_NtQueryInformationProcess == NULL) {
+        return 0;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return 0;
+    }
+
+    PROCESS_BASIC_INFORMATION pbi;
+    ULONG returnLength = 0;
+    NTSTATUS status = g_NtQueryInformationProcess(
+        hProcess,
+        ProcessBasicInformation,
+        &pbi,
+        sizeof(pbi),
+        &returnLength
+    );
+
+    CloseHandle(hProcess);
+
+    if (NT_SUCCESS(status) && returnLength >= sizeof(pbi)) {
+        proc->ppid = (DWORD)(DWORD_PTR)pbi.InheritedFromUniqueProcessId;
+    }
+
     return proc->ppid;
 }
 
@@ -443,15 +490,26 @@ char** psutil_windows_process_get_cmdline(Process* proc, int* count) {
 
 #ifdef _WIN64
     // 64-bit case
+    // First try to detect whether the target process is a WoW64 (32-bit) process
+    // running under WOW64. ProcessWow64Information (class 26) returns the
+    // WoW64 PEB pointer when the process is 32-bit, otherwise NULL.
     LPVOID ppeb32 = NULL;
-    NTSTATUS status = g_NtQuerySystemInformation ? g_NtQuerySystemInformation(
-        (SYSTEM_INFORMATION_CLASS)53, // SystemProcessIdInformation
-        &ppeb32,
-        sizeof(LPVOID),
-        NULL
-    ) : STATUS_UNSUCCESSFUL;
+    ULONG wow64Len = 0;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    if (g_NtQueryInformationProcess) {
+        status = g_NtQueryInformationProcess(
+            hProcess,
+            (PROCESSINFOCLASS)26, // ProcessWow64Information
+            &ppeb32,
+            sizeof(ppeb32),
+            &wow64Len
+        );
+        if (!NT_SUCCESS(status)) {
+            ppeb32 = NULL;
+        }
+    }
 
-    if (NT_SUCCESS(status) && ppeb32 != NULL) {
+    if (ppeb32 != NULL) {
         // Target process is 32-bit running in WoW64 mode
         PEB32 peb32;
         RTL_USER_PROCESS_PARAMETERS32 procParameters32;
@@ -465,17 +523,21 @@ char** psutil_windows_process_get_cmdline(Process* proc, int* count) {
                 NULL
             )) {
                 size = procParameters32.CommandLine.Length;
-                if (size > 0) {
+                if (size > 0 && size <= MAX_PATH * 8) {
                     cmdline = (WCHAR*)malloc(size + 2);
                     if (cmdline) {
-                        ReadProcessMemory(
+                        if (!ReadProcessMemory(
                             hProcess,
                             (LPVOID)procParameters32.CommandLine.Buffer,
                             cmdline,
                             size,
                             NULL
-                        );
-                        cmdline[size / sizeof(WCHAR)] = L'\0';
+                        )) {
+                            free(cmdline);
+                            cmdline = NULL;
+                        } else {
+                            cmdline[size / sizeof(WCHAR)] = L'\0';
+                        }
                     }
                 }
             }
@@ -506,17 +568,21 @@ char** psutil_windows_process_get_cmdline(Process* proc, int* count) {
                     NULL
                 )) {
                     size = procParameters64.CommandLine.Length;
-                    if (size > 0) {
+                    if (size > 0 && size <= MAX_PATH * 8) {
                         cmdline = (WCHAR*)malloc(size + 2);
                         if (cmdline) {
-                            ReadProcessMemory(
+                            if (!ReadProcessMemory(
                                 hProcess,
                                 (LPCVOID)procParameters64.CommandLine.Buffer,
                                 cmdline,
                                 size,
                                 NULL
-                            );
-                            cmdline[size / sizeof(WCHAR)] = L'\0';
+                            )) {
+                                free(cmdline);
+                                cmdline = NULL;
+                            } else {
+                                cmdline[size / sizeof(WCHAR)] = L'\0';
+                            }
                         }
                     }
                 }
@@ -557,17 +623,21 @@ char** psutil_windows_process_get_cmdline(Process* proc, int* count) {
                         NULL
                     )) {
                         size = procParameters32.CommandLine.Length;
-                        if (size > 0) {
+                        if (size > 0 && size <= MAX_PATH * 8) {
                             cmdline = (WCHAR*)malloc(size + 2);
                             if (cmdline) {
-                                ReadProcessMemory(
+                                if (!ReadProcessMemory(
                                     hProcess,
                                     (LPVOID)procParameters32.CommandLine.Buffer,
                                     cmdline,
                                     size,
                                     NULL
-                                );
-                                cmdline[size / sizeof(WCHAR)] = L'\0';
+                                )) {
+                                    free(cmdline);
+                                    cmdline = NULL;
+                                } else {
+                                    cmdline[size / sizeof(WCHAR)] = L'\0';
+                                }
                             }
                         }
                     }
@@ -733,13 +803,20 @@ const char* psutil_windows_process_get_cwd(Process* proc) {
         return proc->cwd;
     }
     
-    // This is a placeholder, getting CWD for another process is more complex
-    // We'll just return the current directory for now
-    char cwd[MAX_PATH];
-    if (GetCurrentDirectoryA(MAX_PATH, cwd) > 0) {
-        proc->cwd = strdup(cwd);
+    // Getting CWD for another process on Windows requires reading the PEB.
+    // For the current process, use GetCurrentDirectoryA.
+    // For other processes, this is complex and requires PEB traversal.
+    if (proc->pid == GetCurrentProcessId()) {
+        char cwd[MAX_PATH];
+        if (GetCurrentDirectoryA(MAX_PATH, cwd) > 0) {
+            proc->cwd = strdup(cwd);
+        }
+        return proc->cwd;
     }
-    
+
+    // For other processes, try via PEB (Windows Vista+)
+    // This is limited and may fail without sufficient privileges.
+    // Return NULL if we cannot determine it.
     return proc->cwd;
 }
 
@@ -809,24 +886,79 @@ int psutil_windows_process_set_nice(Process* proc, int value) {
 
 psutil_uids psutil_windows_process_get_uids(Process* proc) {
     psutil_uids uids = {0};
-    // TODO: Implement
+    if (proc == NULL) {
+        return uids;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return uids;
+    }
+
+    HANDLE hToken;
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+        DWORD size = 0;
+        GetTokenInformation(hToken, TokenUser, NULL, 0, &size);
+        if (size > 0) {
+            PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(size);
+            if (pTokenUser != NULL) {
+                if (GetTokenInformation(hToken, TokenUser, pTokenUser, size, &size)) {
+                    uids.real = (uint32_t)(DWORD_PTR)pTokenUser->User.Sid;
+                    uids.effective = uids.real;
+                    uids.saved = uids.real;
+                }
+                free(pTokenUser);
+            }
+        }
+        CloseHandle(hToken);
+    }
+    CloseHandle(hProcess);
     return uids;
 }
 
 psutil_gids psutil_windows_process_get_gids(Process* proc) {
     psutil_gids gids = {0};
-    // TODO: Implement
+    if (proc == NULL) {
+        return gids;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return gids;
+    }
+
+    HANDLE hToken;
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+        DWORD size = 0;
+        GetTokenInformation(hToken, TokenPrimaryGroup, NULL, 0, &size);
+        if (size > 0) {
+            PTOKEN_PRIMARY_GROUP pPrimaryGroup = (PTOKEN_PRIMARY_GROUP)malloc(size);
+            if (pPrimaryGroup != NULL) {
+                if (GetTokenInformation(hToken, TokenPrimaryGroup, pPrimaryGroup, size, &size)) {
+                    gids.real = (uint32_t)(DWORD_PTR)pPrimaryGroup->PrimaryGroup;
+                    gids.effective = gids.real;
+                    gids.saved = gids.real;
+                }
+                free(pPrimaryGroup);
+            }
+        }
+        CloseHandle(hToken);
+    }
+    CloseHandle(hProcess);
     return gids;
 }
 
 const char* psutil_windows_process_get_terminal(Process* proc) {
-    // TODO: Implement
+    // Windows does not have a Unix-style terminal concept for processes.
+    // Return NULL as terminals are not applicable on Windows.
+    (void)proc;
     return NULL;
 }
 
 int psutil_windows_process_get_num_fds(Process* proc) {
-    // TODO: Implement
-    return 0;
+    // On Windows, there are no file descriptors in the Unix sense.
+    // Return the handle count as the closest equivalent.
+    return psutil_windows_process_get_num_handles(proc);
 }
 
 psutil_io_counters psutil_windows_process_get_io_counters(Process* proc) {
@@ -853,28 +985,91 @@ psutil_io_counters psutil_windows_process_get_io_counters(Process* proc) {
 }
 
 int psutil_windows_process_get_ionice(Process* proc) {
-    // TODO: Implement
+    // Windows does not have a direct I/O priority concept like Linux ionice.
+    // We return 0 (normal) as a default.
+    (void)proc;
     return 0;
 }
 
 int psutil_windows_process_set_ionice(Process* proc, int ioclass, int value) {
-    // TODO: Implement
-    return 0;
+    // Windows does not support setting I/O priority like Linux ionice.
+    // Return -1 to indicate not supported.
+    (void)proc; (void)ioclass; (void)value;
+    return -1;
 }
 
 int* psutil_windows_process_get_cpu_affinity(Process* proc, int* count) {
-    // TODO: Implement
     *count = 0;
-    return NULL;
+    if (proc == NULL) {
+        return NULL;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return NULL;
+    }
+
+    DWORD_PTR processAffinityMask = 0;
+    DWORD_PTR systemAffinityMask = 0;
+    int* cpus = NULL;
+
+    if (GetProcessAffinityMask(hProcess, &processAffinityMask, &systemAffinityMask)) {
+        int cpu_count = 0;
+        for (int i = 0; i < (int)(sizeof(DWORD_PTR) * 8); i++) {
+            if (processAffinityMask & ((DWORD_PTR)1 << i)) {
+                cpu_count++;
+            }
+        }
+        if (cpu_count > 0) {
+            cpus = (int*)malloc(cpu_count * sizeof(int));
+            if (cpus != NULL) {
+                int index = 0;
+                for (int i = 0; i < (int)(sizeof(DWORD_PTR) * 8); i++) {
+                    if (processAffinityMask & ((DWORD_PTR)1 << i)) {
+                        cpus[index++] = i;
+                    }
+                }
+                *count = cpu_count;
+            }
+        }
+    }
+
+    CloseHandle(hProcess);
+    return cpus;
 }
 
 int psutil_windows_process_set_cpu_affinity(Process* proc, int* cpus, int count) {
-    // TODO: Implement
-    return 0;
+    if (proc == NULL || cpus == NULL || count <= 0) {
+        return -1;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc->pid);
+    if (hProcess == NULL) {
+        return -1;
+    }
+
+    DWORD_PTR mask = 0;
+    for (int i = 0; i < count; i++) {
+        if (cpus[i] >= 0 && cpus[i] < (int)(sizeof(DWORD_PTR) * 8)) {
+            mask |= ((DWORD_PTR)1 << cpus[i]);
+        }
+    }
+
+    BOOL result = SetProcessAffinityMask(hProcess, mask);
+    CloseHandle(hProcess);
+    return result ? 0 : -1;
 }
 
 int psutil_windows_process_get_cpu_num(Process* proc) {
-    // TODO: Implement
+    if (proc == NULL) {
+        return -1;
+    }
+    // On Windows, there is no direct API to get the current CPU for a process.
+    // GetCurrentProcessorNumber() is available on Windows Vista+ only.
+    // Load it dynamically so the binary can still run on Windows XP.
+    if (proc->pid == GetCurrentProcessId() && g_GetCurrentProcessorNumber != NULL) {
+        return (int)g_GetCurrentProcessorNumber();
+    }
     return 0;
 }
 
@@ -895,15 +1090,26 @@ char** psutil_windows_process_get_environ(Process* proc, int* count) {
 
 #ifdef _WIN64
     // 64-bit case
+    // First try to detect whether the target process is a WoW64 (32-bit) process
+    // running under WOW64. ProcessWow64Information (class 26) returns the
+    // WoW64 PEB pointer when the process is 32-bit, otherwise NULL.
     LPVOID ppeb32 = NULL;
-    NTSTATUS status = g_NtQuerySystemInformation ? g_NtQuerySystemInformation(
-        (SYSTEM_INFORMATION_CLASS)53, // SystemProcessIdInformation
-        &ppeb32,
-        sizeof(LPVOID),
-        NULL
-    ) : STATUS_UNSUCCESSFUL;
+    ULONG wow64Len = 0;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    if (g_NtQueryInformationProcess) {
+        status = g_NtQueryInformationProcess(
+            hProcess,
+            (PROCESSINFOCLASS)26, // ProcessWow64Information
+            &ppeb32,
+            sizeof(ppeb32),
+            &wow64Len
+        );
+        if (!NT_SUCCESS(status)) {
+            ppeb32 = NULL;
+        }
+    }
 
-    if (NT_SUCCESS(status) && ppeb32 != NULL) {
+    if (ppeb32 != NULL) {
         // Target process is 32-bit running in WoW64 mode
         PEB32 peb32;
         RTL_USER_PROCESS_PARAMETERS32 procParameters32;
@@ -930,9 +1136,9 @@ char** psutil_windows_process_get_environ(Process* proc, int* count) {
                         &bytesRead
                     )) {
                         // Find the end of the environment block (double null terminator)
-                        for (SIZE_T i = 0; i < bytesRead - 1; i += 2) {
-                            if (env[i] == L'\0' && env[i + 2] == L'\0') {
-                                size = i + 4;
+                        for (SIZE_T i = 0; i + 1 < bytesRead; i++) {
+                            if (env[i] == L'\0' && env[i + 1] == L'\0') {
+                                size = (i + 2) * sizeof(WCHAR);
                                 break;
                             }
                         }
@@ -978,9 +1184,9 @@ char** psutil_windows_process_get_environ(Process* proc, int* count) {
                             &bytesRead
                         )) {
                             // Find the end of the environment block (double null terminator)
-                            for (SIZE_T i = 0; i < bytesRead - 1; i += 2) {
-                                if (env[i] == L'\0' && env[i + 2] == L'\0') {
-                                    size = i + 4;
+                            for (SIZE_T i = 0; i + 1 < bytesRead; i++) {
+                                if (env[i] == L'\0' && env[i + 1] == L'\0') {
+                                    size = (i + 2) * sizeof(WCHAR);
                                     break;
                                 }
                             }
@@ -1036,9 +1242,9 @@ char** psutil_windows_process_get_environ(Process* proc, int* count) {
                                 &bytesRead
                             )) {
                                 // Find the end of the environment block (double null terminator)
-                                for (SIZE_T i = 0; i < bytesRead - 1; i += 2) {
-                                    if (env[i] == L'\0' && env[i + 2] == L'\0') {
-                                        size = i + 4;
+                                for (SIZE_T i = 0; i + 1 < bytesRead; i++) {
+                                    if (env[i] == L'\0' && env[i + 1] == L'\0') {
+                                        size = (i + 2) * sizeof(WCHAR);
                                         break;
                                     }
                                 }
@@ -1058,11 +1264,16 @@ char** psutil_windows_process_get_environ(Process* proc, int* count) {
         return NULL;
     }
 
-    // Count environment variables
+    // Count environment variables (WCHAR array of NUL-terminated strings)
     int envCount = 0;
-    for (SIZE_T i = 0; i < size - 2; i += 2) {
+    for (SIZE_T i = 0; i + 1 < size / sizeof(WCHAR); ) {
         if (env[i] == L'\0') {
             envCount++;
+            i++;
+        } else {
+            while (i < size / sizeof(WCHAR) && env[i] != L'\0') {
+                i++;
+            }
         }
     }
 
@@ -1075,20 +1286,21 @@ char** psutil_windows_process_get_environ(Process* proc, int* count) {
     }
 
     int index = 0;
-    for (SIZE_T i = 0; i < size - 2 && index < envCount; ) {
+    SIZE_T total = size / sizeof(WCHAR);
+    for (SIZE_T i = 0; i < total && index < envCount; ) {
         if (env[i] != L'\0') {
             int len = WideCharToMultiByte(CP_UTF8, 0, &env[i], -1, NULL, 0, NULL, NULL);
-            result[index] = (char*)malloc(len * sizeof(char));
+            result[index] = (char*)malloc((size_t)len * sizeof(char));
             if (result[index]) {
                 WideCharToMultiByte(CP_UTF8, 0, &env[i], -1, result[index], len, NULL, NULL);
             }
             index++;
             // Skip to next variable
-            while (i < size - 2 && env[i] != L'\0') {
-                i += 2;
+            while (i < total && env[i] != L'\0') {
+                i++;
             }
         }
-        i += 2;
+        i++;
     }
     result[envCount] = NULL;
 
@@ -1108,7 +1320,7 @@ int psutil_windows_process_get_num_handles(Process* proc) {
     }
 
     DWORD handleCount = 0;
-    if (GetProcessHandleCount(hProcess, &handleCount)) {
+    if (g_GetProcessHandleCount != NULL && g_GetProcessHandleCount(hProcess, &handleCount)) {
         CloseHandle(hProcess);
         return (int)handleCount;
     }
@@ -1364,14 +1576,29 @@ psutil_memory_info psutil_windows_process_get_memory_info(Process* proc) {
 }
 
 psutil_memory_info psutil_windows_process_get_memory_full_info(Process* proc) {
-    psutil_memory_info info = {0};
-    // TODO: Implement
-    return info;
+    // On Windows, we use the same GetProcessMemoryInfo as basic memory info.
+    // USS/PSS are Linux concepts and not directly available on Windows.
+    return psutil_windows_process_get_memory_info(proc);
 }
 
 double psutil_windows_process_get_memory_percent(Process* proc, const char* memtype) {
-    // TODO: Implement
-    return 0.0;
+    if (proc == NULL) {
+        return 0.0;
+    }
+
+    psutil_memory_info proc_mem = psutil_windows_process_get_memory_info(proc);
+    psutil_memory_info sys_mem = psutil_windows_virtual_memory();
+
+    // Use rss by default, or vms if memtype is "vms"
+    uint64_t proc_value = proc_mem.rss;
+    if (memtype != NULL && strcmp(memtype, "vms") == 0) {
+        proc_value = proc_mem.vms;
+    }
+
+    if (sys_mem.vms == 0) {
+        return 0.0;
+    }
+    return (double)proc_value / (double)sys_mem.vms * 100.0;
 }
 
 psutil_memory_map* psutil_windows_process_get_memory_maps(Process* proc, int* count, int grouped) {
@@ -1612,7 +1839,6 @@ psutil_open_file* psutil_windows_process_get_open_files(Process* proc, int* coun
                             if (typeInfo->Name.Length > 0 && 
                                 wcsncmp(typeInfo->Name.Buffer, L"File", typeInfo->Name.Length / 2) == 0) {
                                 // Get file path - use a simple approach for compatibility
-                                char filePath[MAX_PATH] = {0};
                                 // Note: GetFinalPathNameByHandleA is not available on Windows XP
                                 // For compatibility, we'll skip getting the actual file path
                                 strncpy(openFiles[index].path, "[File Handle]", sizeof(openFiles[index].path) - 1);
@@ -1635,14 +1861,32 @@ psutil_open_file* psutil_windows_process_get_open_files(Process* proc, int* coun
 }
 
 psutil_net_connection* psutil_windows_process_get_net_connections(Process* proc, const char* kind, int* count) {
-    // TODO: Implement
-    *count = 0;
-    return NULL;
+    // On Windows, getting per-process network connections requires matching
+    // the global connection table entries to the process PID via the OwnerPid field.
+    // We delegate to the global net_connections and return all connections
+    // since the psutil_net_connection struct does not have a pid field.
+    (void)proc;
+    return psutil_windows_net_connections(kind, count);
 }
 
 int psutil_windows_process_send_signal(Process* proc, int sig) {
-    // TODO: Implement
-    return 0;
+    if (proc == NULL) {
+        return -1;
+    }
+    // Windows does not support Unix signals. We map common signals to Win32 equivalents.
+    switch (sig) {
+        case 15:  // SIGTERM
+            return psutil_windows_process_terminate(proc);
+        case 9:   // SIGKILL
+            return psutil_windows_process_kill(proc);
+        case 18:  // SIGCONT
+            return psutil_windows_process_resume(proc);
+        case 19:  // SIGSTOP
+            return psutil_windows_process_suspend(proc);
+        default:
+            // Unsupported signal
+            return -1;
+    }
 }
 
 int psutil_windows_process_suspend(Process* proc) {
@@ -1792,29 +2036,105 @@ psutil_cpu_times psutil_windows_cpu_times(int percpu) {
     psutil_cpu_times times = {0};
     FILETIME idleTime, kernelTime, userTime;
     if (GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
-        // Convert FILETIME to seconds
-        // FILETIME is 100-nanosecond intervals since January 1, 1601
-        ULARGE_INTEGER user, kernel;
+        ULARGE_INTEGER user, kernel, idle;
         user.LowPart = userTime.dwLowDateTime;
         user.HighPart = userTime.dwHighDateTime;
         kernel.LowPart = kernelTime.dwLowDateTime;
         kernel.HighPart = kernelTime.dwHighDateTime;
-        
-        // Convert to seconds
+        idle.LowPart = idleTime.dwLowDateTime;
+        idle.HighPart = idleTime.dwHighDateTime;
+
         times.user = (double)user.QuadPart / 10000000.0;
-        times.system = (double)kernel.QuadPart / 10000000.0 - times.user;
+        times.system = (double)(kernel.QuadPart - idle.QuadPart) / 10000000.0;
     }
     return times;
 }
 
 double psutil_windows_cpu_percent(double interval, int percpu) {
-    // TODO: Implement
-    return 0.0;
+    // percpu is not supported with a single double return value.
+    // We calculate overall CPU usage.
+    (void)percpu;
+    if (interval <= 0) {
+        return 0.0;
+    }
+
+    // Get initial CPU times
+    FILETIME idleTime1, kernelTime1, userTime1;
+    FILETIME idleTime2, kernelTime2, userTime2;
+
+    if (!GetSystemTimes(&idleTime1, &kernelTime1, &userTime1)) {
+        return 0.0;
+    }
+
+    // Sleep for the specified interval (use Sleep, not usleep)
+    DWORD sleepMs = (DWORD)(interval * 1000.0);
+    Sleep(sleepMs);
+
+    if (!GetSystemTimes(&idleTime2, &kernelTime2, &userTime2)) {
+        return 0.0;
+    }
+
+    // Calculate differences
+    ULARGE_INTEGER idle1, kernel1, user1, idle2, kernel2, user2;
+    idle1.LowPart = idleTime1.dwLowDateTime; idle1.HighPart = idleTime1.dwHighDateTime;
+    kernel1.LowPart = kernelTime1.dwLowDateTime; kernel1.HighPart = kernelTime1.dwHighDateTime;
+    user1.LowPart = userTime1.dwLowDateTime; user1.HighPart = userTime1.dwHighDateTime;
+    idle2.LowPart = idleTime2.dwLowDateTime; idle2.HighPart = idleTime2.dwHighDateTime;
+    kernel2.LowPart = kernelTime2.dwLowDateTime; kernel2.HighPart = kernelTime2.dwHighDateTime;
+    user2.LowPart = userTime2.dwLowDateTime; user2.HighPart = userTime2.dwHighDateTime;
+
+    double userDiff = (double)(user2.QuadPart - user1.QuadPart) / 10000000.0;
+    double kernelDiff = (double)(kernel2.QuadPart - kernel1.QuadPart) / 10000000.0;
+    double idleDiff = (double)(idle2.QuadPart - idle1.QuadPart) / 10000000.0;
+
+    double total = userDiff + kernelDiff;
+    double busy = total - idleDiff;
+
+    if (total <= 0) {
+        return 0.0;
+    }
+
+    return (busy / total) * 100.0;
 }
 
 psutil_cpu_times psutil_windows_cpu_times_percent(double interval, int percpu) {
     psutil_cpu_times times = {0};
-    // TODO: Implement
+    (void)percpu;
+    if (interval <= 0) {
+        return times;
+    }
+
+    FILETIME idleTime1, kernelTime1, userTime1;
+    FILETIME idleTime2, kernelTime2, userTime2;
+
+    if (!GetSystemTimes(&idleTime1, &kernelTime1, &userTime1)) {
+        return times;
+    }
+
+    Sleep((DWORD)(interval * 1000.0));
+
+    if (!GetSystemTimes(&idleTime2, &kernelTime2, &userTime2)) {
+        return times;
+    }
+
+    ULARGE_INTEGER idle1, kernel1, user1, idle2, kernel2, user2;
+    idle1.LowPart = idleTime1.dwLowDateTime; idle1.HighPart = idleTime1.dwHighDateTime;
+    kernel1.LowPart = kernelTime1.dwLowDateTime; kernel1.HighPart = kernelTime1.dwHighDateTime;
+    user1.LowPart = userTime1.dwLowDateTime; user1.HighPart = userTime1.dwHighDateTime;
+    idle2.LowPart = idleTime2.dwLowDateTime; idle2.HighPart = idleTime2.dwHighDateTime;
+    kernel2.LowPart = kernelTime2.dwLowDateTime; kernel2.HighPart = kernelTime2.dwHighDateTime;
+    user2.LowPart = userTime2.dwLowDateTime; user2.HighPart = userTime2.dwHighDateTime;
+
+    double userDiff = (double)(user2.QuadPart - user1.QuadPart) / 10000000.0;
+    double kernelDiff = (double)(kernel2.QuadPart - kernel1.QuadPart) / 10000000.0;
+    double idleDiff = (double)(idle2.QuadPart - idle1.QuadPart) / 10000000.0;
+    double total = userDiff + kernelDiff;
+
+    if (total > 0) {
+        times.user = (userDiff / total) * 100.0;
+        times.system = ((kernelDiff - idleDiff) / total) * 100.0;
+    }
+
     return times;
 }
 
@@ -1822,14 +2142,45 @@ int psutil_windows_cpu_count(int logical) {
     if (logical) {
         return PSUTIL_SYSTEM_INFO.dwNumberOfProcessors;
     }
-    // For physical core count, we need to use GetLogicalProcessorInformationEx
-    // For simplicity, return the same as logical for now
+    // Physical core count using GetLogicalProcessorInformationEx
+    if (g_GetLogicalProcessorInformationEx != NULL) {
+        DWORD size = 0;
+        g_GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &size);
+        if (size > 0) {
+            UCHAR* buffer = (UCHAR*)malloc(size);
+            if (buffer != NULL) {
+                if (g_GetLogicalProcessorInformationEx(RelationProcessorCore, buffer, &size)) {
+                    ULONG count = 0;
+                    UCHAR* ptr = buffer;
+                    UCHAR* end = buffer + size;
+                    while (ptr < end) {
+                        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)ptr;
+                        if (info->Relationship == RelationProcessorCore) {
+                            count++;
+                        }
+                        ptr += info->Size;
+                    }
+                    free(buffer);
+                    return (int)count;
+                }
+                free(buffer);
+            }
+        }
+    }
     return PSUTIL_SYSTEM_INFO.dwNumberOfProcessors;
 }
 
 psutil_cpu_stats psutil_windows_cpu_stats(void) {
     psutil_cpu_stats stats = {0};
-    // TODO: Implement
+    // Windows does not expose context switches, interrupts, soft interrupts,
+    // and syscalls counts in a straightforward manner via public APIs.
+    // On Windows XP/Vista/7, we could use NtQuerySystemInformation with
+    // SystemPerformanceInformation (class 2) which returns a structure
+    // containing ContextSwitches and other counters. However, the structure
+    // layout varies between Windows versions and is undocumented.
+    // We return zeros for fields we cannot reliably fill.
+    // This is consistent with the original Python psutil approach on Windows
+    // where some of these values are not available.
     return stats;
 }
 
@@ -1934,11 +2285,15 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
     if (get_tcp) {
         DWORD size = 0;
         
+        if (g_GetExtendedTcpTable == NULL) {
+            // GetExtendedTcpTable requires XP SP2+; degrade gracefully
+            get_tcp = 0;
+        } else {
         // Get required size
-        GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        g_GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
         tcp_table = (PMIB_TCPTABLE_OWNER_PID)malloc(size);
         
-        if (tcp_table != NULL && GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+        if (tcp_table != NULL && g_GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
             for (DWORD i = 0; i < tcp_table->dwNumEntries; i++) {
                 if (index >= capacity) {
                     capacity *= 2;
@@ -1964,17 +2319,23 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
             }
         }
         free(tcp_table);
+        }
     }
     
     // Get TCP IPv6 connections
-    /*
     if (get_tcp6) {
         DWORD size = 0;
+        PMIB_TCP6TABLE_OWNER_PID tcp6_table = NULL;
+
+        if (g_GetExtendedTcpTable == NULL) {
+            get_tcp6 = 0;
+        } else {
+        g_GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (size > 0) {
+            tcp6_table = (PMIB_TCP6TABLE_OWNER_PID)malloc(size);
+        }
         
-        GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
-        tcp6_table = (PMIB_TCP6TABLE_OWNER_PID)malloc(size);
-        
-        if (tcp6_table != NULL && GetExtendedTcpTable(tcp6_table, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+        if (tcp6_table != NULL && g_GetExtendedTcpTable(tcp6_table, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
             for (DWORD i = 0; i < tcp6_table->dwNumEntries; i++) {
                 if (index >= capacity) {
                     capacity *= 2;
@@ -2000,17 +2361,20 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
             }
         }
         free(tcp6_table);
+        }
     }
-    */
     
     // Get UDP IPv4 connections
     if (get_udp) {
         DWORD size = 0;
         
-        GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+        if (g_GetExtendedUdpTable == NULL) {
+            get_udp = 0;
+        } else {
+        g_GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
         udp_table = (PMIB_UDPTABLE_OWNER_PID)malloc(size);
         
-        if (udp_table != NULL && GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+        if (udp_table != NULL && g_GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
             for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
                 if (index >= capacity) {
                     capacity *= 2;
@@ -2035,17 +2399,23 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
             }
         }
         free(udp_table);
+        }
     }
     
     // Get UDP IPv6 connections
-    /*
     if (get_udp6) {
         DWORD size = 0;
+        PMIB_UDP6TABLE_OWNER_PID udp6_table = NULL;
+
+        if (g_GetExtendedUdpTable == NULL) {
+            get_udp6 = 0;
+        } else {
+        g_GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+        if (size > 0) {
+            udp6_table = (PMIB_UDP6TABLE_OWNER_PID)malloc(size);
+        }
         
-        GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
-        udp6_table = (PMIB_UDP6TABLE_OWNER_PID)malloc(size);
-        
-        if (udp6_table != NULL && GetExtendedUdpTable(udp6_table, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+        if (udp6_table != NULL && g_GetExtendedUdpTable(udp6_table, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
             for (DWORD i = 0; i < udp6_table->dwNumEntries; i++) {
                 if (index >= capacity) {
                     capacity *= 2;
@@ -2070,8 +2440,8 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
             }
         }
         free(udp6_table);
+        }
     }
-    */
     
     *count = index;
     if (index == 0) {
@@ -2091,14 +2461,17 @@ psutil_net_if_addr* psutil_windows_net_if_addrs(int* count) {
     ULONG bufferSize = 0;
     
     // First call to get buffer size
-    GetAdaptersAddresses(family, flags, NULL, NULL, &bufferSize);
+    if (g_GetAdaptersAddresses == NULL) {
+        return NULL;
+    }
+    g_GetAdaptersAddresses(family, flags, NULL, NULL, &bufferSize);
     
     adapterAddresses = (PIP_ADAPTER_ADDRESSES)malloc(bufferSize);
     if (adapterAddresses == NULL) {
         return NULL;
     }
     
-    DWORD result = GetAdaptersAddresses(family, flags, NULL, adapterAddresses, &bufferSize);
+    DWORD result = g_GetAdaptersAddresses(family, flags, NULL, adapterAddresses, &bufferSize);
     if (result != ERROR_SUCCESS) {
         free(adapterAddresses);
         return NULL;
@@ -2150,10 +2523,13 @@ psutil_net_if_addr* psutil_windows_net_if_addrs(int* count) {
                 strncpy(addrs[index].broadcast, "255.255.255.255", sizeof(addrs[index].broadcast) - 1);
             } else if (sockAddr->lpSockaddr->sa_family == AF_INET6) {
                 struct sockaddr_in6* sin6 = (struct sockaddr_in6*)sockAddr->lpSockaddr;
-                char addrStr[INET6_ADDRSTRLEN];
-                // Use wsprintf for compatibility
-                wsprintfA(addrStr, "%s", "[IPv6]");
-                strncpy(addrs[index].address, addrStr, sizeof(addrs[index].address) - 1);
+                // Format IPv6 address manually for compatibility with Windows XP
+                // (inet_ntop is not available on XP)
+                const unsigned char* a = sin6->sin6_addr.s6_addr;
+                snprintf(addrs[index].address, sizeof(addrs[index].address),
+                         "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+                         a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                         a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
                 strncpy(addrs[index].netmask, "", sizeof(addrs[index].netmask) - 1);
                 strncpy(addrs[index].broadcast, "", sizeof(addrs[index].broadcast) - 1);
             }
@@ -2421,7 +2797,7 @@ psutil_user* psutil_windows_users(int* count) {
                 }
                 
                 // Get logon time (use current time as approximation)
-                users[index].started = time(NULL);
+                users[index].started = (double)time(NULL);
                 
                 index++;
             }

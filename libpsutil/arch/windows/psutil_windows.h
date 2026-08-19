@@ -7,6 +7,8 @@
 #ifndef PSUTIL_WINDOWS_H
 #define PSUTIL_WINDOWS_H
 
+#include "../../psutil.h"
+
 #include <winsock2.h>
 #include <windows.h>
 #include <psapi.h>
@@ -118,6 +120,11 @@ typedef BOOL (WINAPI *PWTSEnumerateSessionsW)(HANDLE hServer, DWORD Reserved, DW
 typedef BOOL (WINAPI *PWTSQuerySessionInformationW)(HANDLE hServer, DWORD SessionId, WTS_INFO_CLASS WTSInfoClass, LPWSTR *ppBuffer, DWORD *pBytesReturned);
 typedef VOID (WINAPI *PWTSFreeMemory)(PVOID pMemory);
 typedef ULONGLONG (WINAPI *PGetTickCount64)(VOID);
+typedef DWORD (WINAPI *PGetCurrentProcessorNumber)(VOID);
+typedef BOOL (WINAPI *PGetProcessHandleCount)(HANDLE hProcess, PDWORD pdwHandleCount);
+typedef DWORD (WINAPI *PGetExtendedTcpTable)(PVOID pTcpTable, PDWORD pdwSize, BOOL bOrder, ULONG ulAf, ULONG TableClass, ULONG Reserved);
+typedef DWORD (WINAPI *PGetExtendedUdpTable)(PVOID pUdpTable, PDWORD pdwSize, BOOL bOrder, ULONG ulAf, ULONG TableClass, ULONG Reserved);
+typedef ULONG (WINAPI *PGetAdaptersAddresses)(ULONG Family, ULONG Flags, PVOID Reserved, PIP_ADAPTER_ADDRESSES pAdapterAddresses, PULONG pSizePointer);
 
 // Global function pointers
 extern PNtQuerySystemInformation g_NtQuerySystemInformation;
@@ -137,6 +144,11 @@ extern PWTSEnumerateSessionsW g_WTSEnumerateSessionsW;
 extern PWTSQuerySessionInformationW g_WTSQuerySessionInformationW;
 extern PWTSFreeMemory g_WTSFreeMemory;
 extern PGetTickCount64 g_GetTickCount64;
+extern PGetCurrentProcessorNumber g_GetCurrentProcessorNumber;
+extern PGetProcessHandleCount g_GetProcessHandleCount;
+extern PGetExtendedTcpTable g_GetExtendedTcpTable;
+extern PGetExtendedUdpTable g_GetExtendedUdpTable;
+extern PGetAdaptersAddresses g_GetAdaptersAddresses;
 
 // Helper functions
 double psutil_FiletimeToUnixTime(FILETIME ft);
@@ -151,11 +163,11 @@ int psutil_set_winver(void);
 int psutil_windows_init(void);
 
 // Process functions
-int psutil_windows_pid_exists(DWORD pid);
-uint32_t* psutil_windows_pids(int *count);
-Process* psutil_windows_process_new(DWORD pid);
+int psutil_windows_pid_exists(psutil_pid_t pid);
+psutil_pid_t* psutil_windows_pids(int *count);
+Process* psutil_windows_process_new(psutil_pid_t pid);
 void psutil_windows_process_free(Process* proc);
-DWORD psutil_windows_process_get_ppid(Process* proc);
+psutil_pid_t psutil_windows_process_get_ppid(Process* proc);
 const char* psutil_windows_process_get_name(Process* proc);
 const char* psutil_windows_process_get_exe(Process* proc);
 char** psutil_windows_process_get_cmdline(Process* proc, int* count);

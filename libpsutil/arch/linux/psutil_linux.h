@@ -7,6 +7,7 @@
 #ifndef PSUTIL_LINUX_H
 #define PSUTIL_LINUX_H
 
+#include "../../psutil.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -31,11 +32,11 @@
 int psutil_linux_init(void);
 
 // Process functions
-int psutil_linux_pid_exists(pid_t pid);
-pid_t* psutil_linux_pids(int *count);
-Process* psutil_linux_process_new(pid_t pid);
+int psutil_linux_pid_exists(psutil_pid_t pid);
+psutil_pid_t* psutil_linux_pids(int *count);
+Process* psutil_linux_process_new(psutil_pid_t pid);
 void psutil_linux_process_free(Process* proc);
-pid_t psutil_linux_process_get_ppid(Process* proc);
+psutil_pid_t psutil_linux_process_get_ppid(Process* proc);
 const char* psutil_linux_process_get_name(Process* proc);
 const char* psutil_linux_process_get_exe(Process* proc);
 char** psutil_linux_process_get_cmdline(Process* proc, int* count);
