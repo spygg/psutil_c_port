@@ -92,9 +92,10 @@ psutil_net_connection* psutil_android_net_connections(const char* kind, int* cou
 psutil_net_if_addr* psutil_android_net_if_addrs(int* count);
 psutil_net_if_stat* psutil_android_net_if_stats(int* count);
 psutil_io_counters psutil_android_disk_io_counters(int perdisk);
-psutil_disk_partition* psutil_android_disk_partitions(int all);
+psutil_disk_partition* psutil_android_disk_partitions(int all, int* count);
 psutil_disk_usage psutil_android_disk_usage(const char* path);
 psutil_user* psutil_android_users(int* count);
 double psutil_android_boot_time(void);
 
 #endif // PSUTIL_ANDROID_H
+

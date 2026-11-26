@@ -91,6 +91,35 @@ PVOID psutil_GetProcAddressFromLib(LPCSTR libname, LPCSTR procname) {
     return addr;
 }
 
+// Converts a wide string to a freshly allocated UTF-8 buffer. Every ANSI API
+// used here (GetModuleBaseNameA, LookupAccountSidA, ...) mangles non-ASCII
+// names into '?' on Chinese Windows, so all of them are replaced by the W
+// variants feeding this helper.
+char* psutil_windows_wide_to_utf8(const WCHAR* w, int len) {
+    int bytes;
+    char* out;
+
+    if (w == NULL) {
+        return NULL;
+    }
+    if (len < 0) {
+        len = (int)wcslen(w);
+    }
+    bytes = WideCharToMultiByte(CP_UTF8, 0, w, len, NULL, 0, NULL, NULL);
+    if (bytes <= 0) {
+        return NULL;
+    }
+    out = (char*)malloc((size_t)bytes + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, w, len, out, bytes, NULL, NULL) <= 0) {
+        free(out);
+        return NULL;
+    }
+    out[bytes] = '\0';
+    return out;
+}
 PVOID psutil_SetFromNTStatusErr(NTSTATUS Status, const char *syscall) {
     ULONG err;
 
@@ -242,30 +271,29 @@ psutil_pid_t* psutil_windows_pids(int *count) {
         return NULL;
     }
 
-    if (!EnumProcesses(pids, size * sizeof(DWORD), &needed)) {
-        free(pids);
-        *count = 0;
-        return NULL;
-    }
-
-    // If the buffer was too small, retry with the required size
-    if (needed > size * sizeof(DWORD)) {
-        size = needed / sizeof(DWORD);
-        DWORD *new_pids = (DWORD*)realloc(pids, needed);
-        if (new_pids == NULL) {
+    // EnumProcesses only reports the required size through `needed` when the
+    // buffer was too small. The old code gave up in exactly that case, so on
+    // any machine with more than ~1024 processes pids() returned NULL.
+    for (;;) {
+        DWORD* np = (DWORD*)realloc(pids, (size_t)size * sizeof(DWORD));
+        if (np == NULL) {
             free(pids);
-            *count = 0;
+            psutil_set_last_error(PSUTIL_ERROR_MEMORY);
             return NULL;
         }
-        pids = new_pids;
-        if (!EnumProcesses(pids, needed, &needed)) {
+        pids = np;
+        if (!EnumProcesses(pids, size * sizeof(DWORD), &needed)) {
             free(pids);
-            *count = 0;
+            psutil_set_last_error(PSUTIL_ERROR_IO);
             return NULL;
         }
+        if (needed < size * sizeof(DWORD)) {
+            break;
+        }
+        size = needed / sizeof(DWORD) + 16;
     }
 
-    *count = needed / sizeof(DWORD);
+    *count = (int)(needed / sizeof(DWORD));
     return (psutil_pid_t*)pids;
 }
 
@@ -287,15 +315,13 @@ Process* psutil_windows_process_new(psutil_pid_t pid) {
     proc->username = NULL;
     proc->create_time = 0.0;
     proc->ppid = 0;
-    proc->status = STATUS_RUNNING;
+    proc->status = PSUTIL_STATUS_RUNNING;
+    proc->_platform = NULL;
 
-    // Try to get process information immediately
-    psutil_windows_process_get_name(proc);
-    psutil_windows_process_get_exe(proc);
-    psutil_windows_process_get_username(proc);
-    psutil_windows_process_get_create_time(proc);
-    psutil_windows_process_get_cwd(proc);
-
+    // Getters are lazy: fetching name/exe/username/cwd/create_time here made
+    // every single process_new() call open the process up to five times (and
+    // run a potentially network-bound LookupAccountSid). process_refresh()
+    // and the individual getters fill these in on demand.
     return proc;
 }
 
@@ -376,10 +402,14 @@ const char* psutil_windows_process_get_name(Process* proc) {
         }
     }
     
-    char name[MAX_PATH];
-    DWORD size = MAX_PATH;
-    if (GetModuleBaseNameA(hProcess, NULL, name, size) > 0) {
-        proc->name = strdup(name);
+    {
+        WCHAR name[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (GetModuleBaseNameW(hProcess, NULL, name, size) > 0) {
+            proc->name = psutil_windows_wide_to_utf8(name, -1);
+        } else {
+            psutil_set_last_error(PSUTIL_ERROR_PERMISSION);
+        }
     }
     
     CloseHandle(hProcess);
@@ -405,46 +435,48 @@ const char* psutil_windows_process_get_exe(Process* proc) {
         }
     }
     
-    char exe[MAX_PATH];
-    DWORD size = MAX_PATH;
-    if (GetModuleFileNameExA(hProcess, NULL, exe, size) > 0) {
-        proc->exe = strdup(exe);
+    {
+        WCHAR exe[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (GetModuleFileNameExW(hProcess, NULL, exe, size) > 0) {
+            proc->exe = psutil_windows_wide_to_utf8(exe, -1);
+        } else {
+            psutil_set_last_error(PSUTIL_ERROR_PERMISSION);
+        }
     }
     
     CloseHandle(hProcess);
     return proc->exe;
 }
 
-// Process environment block structures for 32-bit processes
+// --- Process environment block layouts -----------------------------------
+// These structs are built by the *host* binary, so the 32-bit variants must
+// use 32-bit-width fields even on x64: ULONG_PTR is 8 bytes there, which
+// silently shifted every following offset and made WOW64 PEB reads garbage.
+typedef struct _UNICODE_STRING32 {
+    USHORT Length;
+    USHORT MaximumLength;
+    DWORD Buffer;
+} UNICODE_STRING32;
+
+typedef struct _UNICODE_STRING64 {
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONG Reserved;
+    ULONG_PTR Buffer;
+} UNICODE_STRING64;
+
+// PEB layout: BeingDebugged at 0x02, Ldr at 0x0C (x86) / 0x18 (x64),
+// ProcessParameters at 0x10 (x86) / 0x20 (x64).
 typedef struct _PEB32 {
     BYTE Reserved1[2];
     BYTE BeingDebugged;
     BYTE Reserved2[1];
-    ULONG_PTR Reserved3[2];
-    ULONG_PTR Ldr;
-    ULONG_PTR ProcessParameters;
-    BYTE Reserved4[104];
-    ULONG_PTR Reserved5[52];
-    BYTE Reserved6[464];
-    ULONG_PTR Reserved7[14];
-} PEB32, *PPEB32;
+    DWORD Reserved3[2];
+    DWORD Ldr;
+    DWORD ProcessParameters;
+} PEB32;
 
-typedef struct _UNICODE_STRING32 {
-    USHORT Length;
-    USHORT MaximumLength;
-    ULONG_PTR Buffer;
-} UNICODE_STRING32, *PUNICODE_STRING32;
-
-typedef struct _RTL_USER_PROCESS_PARAMETERS32 {
-    BYTE Reserved1[16];
-    ULONG_PTR Reserved2[10];
-    UNICODE_STRING32 ImagePathName;
-    UNICODE_STRING32 CommandLine;
-    UNICODE_STRING32 CurrentDirectoryPath;
-    ULONG_PTR env;
-} RTL_USER_PROCESS_PARAMETERS32, *PRTL_USER_PROCESS_PARAMETERS32;
-
-// Process environment block structures for 64-bit processes
 typedef struct _PEB64 {
     BYTE Reserved1[2];
     BYTE BeingDebugged;
@@ -452,196 +484,126 @@ typedef struct _PEB64 {
     ULONG_PTR Reserved3[2];
     ULONG_PTR Ldr;
     ULONG_PTR ProcessParameters;
-    BYTE Reserved4[104];
-    ULONG_PTR Reserved5[52];
-    BYTE Reserved6[464];
-    ULONG_PTR Reserved7[14];
-} PEB64, *PPEB64;
+} PEB64;
 
-typedef struct _UNICODE_STRING64 {
-    USHORT Length;
-    USHORT MaximumLength;
-    ULONG_PTR Buffer;
-} UNICODE_STRING64, *PUNICODE_STRING64;
+// CommandLine lives at a fixed offset inside RTL_USER_PROCESS_PARAMETERS.
+// Reading it by offset is deliberate: the full structure is large and version
+// dependent (it also starts with a CURDIR block that the old definition
+// forgot), while these two offsets are stable.
+#define PSUTIL_PARAMS_CMDLINE_OFFSET32 0x40
+#define PSUTIL_PARAMS_CMDLINE_OFFSET64 0x80
 
-typedef struct _RTL_USER_PROCESS_PARAMETERS64 {
-    BYTE Reserved1[16];
-    ULONG_PTR Reserved2[10];
-    UNICODE_STRING64 ImagePathName;
-    UNICODE_STRING64 CommandLine;
-    UNICODE_STRING64 CurrentDirectoryPath;
-    ULONG_PTR env;
-} RTL_USER_PROCESS_PARAMETERS64, *PRTL_USER_PROCESS_PARAMETERS64;
+static WCHAR* psutil_windows_read_cmdline_w(HANDLE hProcess, ULONG_PTR params,
+                                            int is32) {
+    ULONG_PTR buffer = 0;
+    USHORT len = 0;
+    WCHAR* out;
+
+    if (params == 0) {
+        return NULL;
+    }
+
+    if (is32) {
+        UNICODE_STRING32 us;
+        ULONG_PTR addr = (ULONG_PTR)(DWORD)params + PSUTIL_PARAMS_CMDLINE_OFFSET32;
+        if (!ReadProcessMemory(hProcess, (LPCVOID)addr, &us, sizeof(us), NULL)) {
+            return NULL;
+        }
+        len = us.Length;
+        buffer = (ULONG_PTR)us.Buffer;
+    } else {
+        UNICODE_STRING64 us;
+        ULONG_PTR addr = params + PSUTIL_PARAMS_CMDLINE_OFFSET64;
+        if (!ReadProcessMemory(hProcess, (LPCVOID)addr, &us, sizeof(us), NULL)) {
+            return NULL;
+        }
+        len = us.Length;
+        buffer = us.Buffer;
+    }
+
+    if (len == 0 || len > 64 * 1024 || buffer == 0) {
+        return NULL;
+    }
+    out = (WCHAR*)malloc((size_t)len + sizeof(WCHAR));
+    if (out == NULL) {
+        return NULL;
+    }
+    if (!ReadProcessMemory(hProcess, (LPCVOID)buffer, out, len, NULL)) {
+        free(out);
+        return NULL;
+    }
+    out[len / sizeof(WCHAR)] = L'\0';
+    return out;
+}
 
 char** psutil_windows_process_get_cmdline(Process* proc, int* count) {
-    if (proc == NULL) {
-        *count = 0;
-        return NULL;
-    }
-
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, proc->pid);
-    if (hProcess == NULL) {
-        *count = 0;
-        return NULL;
-    }
-
+    HANDLE hProcess;
     WCHAR* cmdline = NULL;
-    SIZE_T size = 0;
+    LPWSTR* args;
+    char** result;
+    int nArgs = 0;
+    int i;
+
+    *count = 0;
+    if (proc == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return NULL;
+    }
+
+    hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE,
+                           proc->pid);
+    if (hProcess == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_PERMISSION);
+        return NULL;
+    }
 
 #ifdef _WIN64
-    // 64-bit case
-    // First try to detect whether the target process is a WoW64 (32-bit) process
-    // running under WOW64. ProcessWow64Information (class 26) returns the
-    // WoW64 PEB pointer when the process is 32-bit, otherwise NULL.
-    LPVOID ppeb32 = NULL;
-    ULONG wow64Len = 0;
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-    if (g_NtQueryInformationProcess) {
-        status = g_NtQueryInformationProcess(
-            hProcess,
-            (PROCESSINFOCLASS)26, // ProcessWow64Information
-            &ppeb32,
-            sizeof(ppeb32),
-            &wow64Len
-        );
-        if (!NT_SUCCESS(status)) {
-            ppeb32 = NULL;
+    {
+        LPVOID ppeb32 = NULL;
+        ULONG wow_len = 0;
+        BOOL is_wow64 = FALSE;
+
+        if (g_NtQueryInformationProcess != NULL) {
+            is_wow64 = NT_SUCCESS(g_NtQueryInformationProcess(
+                hProcess, (PROCESSINFOCLASS)26, &ppeb32, sizeof(ppeb32),
+                &wow_len)) && ppeb32 != NULL;
         }
-    }
 
-    if (ppeb32 != NULL) {
-        // Target process is 32-bit running in WoW64 mode
-        PEB32 peb32;
-        RTL_USER_PROCESS_PARAMETERS32 procParameters32;
-
-        if (ReadProcessMemory(hProcess, ppeb32, &peb32, sizeof(peb32), NULL)) {
-            if (ReadProcessMemory(
-                hProcess,
-                (LPVOID)peb32.ProcessParameters,
-                &procParameters32,
-                sizeof(procParameters32),
-                NULL
-            )) {
-                size = procParameters32.CommandLine.Length;
-                if (size > 0 && size <= MAX_PATH * 8) {
-                    cmdline = (WCHAR*)malloc(size + 2);
-                    if (cmdline) {
-                        if (!ReadProcessMemory(
-                            hProcess,
-                            (LPVOID)procParameters32.CommandLine.Buffer,
-                            cmdline,
-                            size,
-                            NULL
-                        )) {
-                            free(cmdline);
-                            cmdline = NULL;
-                        } else {
-                            cmdline[size / sizeof(WCHAR)] = L'\0';
-                        }
-                    }
-                }
+        if (is_wow64) {
+            PEB32 peb32;
+            if (ReadProcessMemory(hProcess, ppeb32, &peb32, sizeof(peb32), NULL)) {
+                cmdline = psutil_windows_read_cmdline_w(
+                    hProcess, (ULONG_PTR)peb32.ProcessParameters, 1);
             }
-        }
-    }
-    else {
-        // Target process is 64-bit
-        PROCESS_BASIC_INFORMATION pbi;
-        ULONG returnLength;
-        status = g_NtQueryInformationProcess(
-            hProcess,
-            ProcessBasicInformation,
-            &pbi,
-            sizeof(pbi),
-            &returnLength
-        );
-
-        if (NT_SUCCESS(status)) {
-            PEB64 peb64;
-            RTL_USER_PROCESS_PARAMETERS64 procParameters64;
-
-            if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb64, sizeof(peb64), NULL)) {
-                if (ReadProcessMemory(
-                    hProcess,
-                    (LPCVOID)peb64.ProcessParameters,
-                    &procParameters64,
-                    sizeof(procParameters64),
-                    NULL
-                )) {
-                    size = procParameters64.CommandLine.Length;
-                    if (size > 0 && size <= MAX_PATH * 8) {
-                        cmdline = (WCHAR*)malloc(size + 2);
-                        if (cmdline) {
-                            if (!ReadProcessMemory(
-                                hProcess,
-                                (LPCVOID)procParameters64.CommandLine.Buffer,
-                                cmdline,
-                                size,
-                                NULL
-                            )) {
-                                free(cmdline);
-                                cmdline = NULL;
-                            } else {
-                                cmdline[size / sizeof(WCHAR)] = L'\0';
-                            }
-                        }
-                    }
+        } else {
+            PROCESS_BASIC_INFORMATION pbi;
+            ULONG ret_len = 0;
+            if (g_NtQueryInformationProcess != NULL &&
+                NT_SUCCESS(g_NtQueryInformationProcess(
+                    hProcess, ProcessBasicInformation, &pbi, sizeof(pbi),
+                    &ret_len))) {
+                PEB64 peb64;
+                if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb64,
+                                      sizeof(peb64), NULL)) {
+                    cmdline = psutil_windows_read_cmdline_w(
+                        hProcess, peb64.ProcessParameters, 0);
                 }
             }
         }
     }
 #else
-    // 32-bit case
-    BOOL weAreWow64, theyAreWow64;
-    if (IsWow64Process(GetCurrentProcess(), &weAreWow64) && 
-        IsWow64Process(hProcess, &theyAreWow64)) {
-        if (weAreWow64 && !theyAreWow64) {
-            // We are 32-bit in WoW64, target is 64-bit
-            // This is complex, we'll skip for now
-        }
-        else {
-            // Both are 32-bit
-            PROCESS_BASIC_INFORMATION pbi;
-            ULONG returnLength;
-            NTSTATUS status = g_NtQueryInformationProcess(
-                hProcess,
-                ProcessBasicInformation,
-                &pbi,
-                sizeof(pbi),
-                &returnLength
-            );
-
-            if (NT_SUCCESS(status)) {
-                PEB32 peb32;
-                RTL_USER_PROCESS_PARAMETERS32 procParameters32;
-
-                if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb32, sizeof(peb32), NULL)) {
-                    if (ReadProcessMemory(
-                        hProcess,
-                        (LPVOID)peb32.ProcessParameters,
-                        &procParameters32,
-                        sizeof(procParameters32),
-                        NULL
-                    )) {
-                        size = procParameters32.CommandLine.Length;
-                        if (size > 0 && size <= MAX_PATH * 8) {
-                            cmdline = (WCHAR*)malloc(size + 2);
-                            if (cmdline) {
-                                if (!ReadProcessMemory(
-                                    hProcess,
-                                    (LPVOID)procParameters32.CommandLine.Buffer,
-                                    cmdline,
-                                    size,
-                                    NULL
-                                )) {
-                                    free(cmdline);
-                                    cmdline = NULL;
-                                } else {
-                                    cmdline[size / sizeof(WCHAR)] = L'\0';
-                                }
-                            }
-                        }
-                    }
-                }
+    {
+        PROCESS_BASIC_INFORMATION pbi;
+        ULONG ret_len = 0;
+        if (g_NtQueryInformationProcess != NULL &&
+            NT_SUCCESS(g_NtQueryInformationProcess(
+                hProcess, ProcessBasicInformation, &pbi, sizeof(pbi),
+                &ret_len))) {
+            PEB32 peb32;
+            if (ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb32,
+                                  sizeof(peb32), NULL)) {
+                cmdline = psutil_windows_read_cmdline_w(
+                    hProcess, (ULONG_PTR)peb32.ProcessParameters, 1);
             }
         }
     }
@@ -649,68 +611,71 @@ char** psutil_windows_process_get_cmdline(Process* proc, int* count) {
 
     CloseHandle(hProcess);
 
-    if (!cmdline) {
-        *count = 0;
+    if (cmdline == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_PERMISSION);
         return NULL;
     }
 
-    // Parse command line
-    int nArgs;
-    LPWSTR* args = CommandLineToArgvW(cmdline, &nArgs);
-    if (!args) {
-        free(cmdline);
-        *count = 0;
+    args = CommandLineToArgvW(cmdline, &nArgs);
+    free(cmdline);
+    if (args == NULL || nArgs <= 0) {
+        if (args != NULL) {
+            LocalFree(args);
+        }
+        psutil_set_last_error(PSUTIL_ERROR_IO);
         return NULL;
     }
 
-    // Convert to char**
-    char** result = (char**)malloc((nArgs + 1) * sizeof(char*));
-    if (!result) {
+    result = (char**)calloc((size_t)nArgs + 1, sizeof(char*));
+    if (result == NULL) {
         LocalFree(args);
-        free(cmdline);
-        *count = 0;
+        psutil_set_last_error(PSUTIL_ERROR_MEMORY);
         return NULL;
     }
-
-    for (int i = 0; i < nArgs; i++) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, args[i], -1, NULL, 0, NULL, NULL);
-        result[i] = (char*)malloc(len * sizeof(char));
-        if (result[i]) {
-            WideCharToMultiByte(CP_UTF8, 0, args[i], -1, result[i], len, NULL, NULL);
+    for (i = 0; i < nArgs; i++) {
+        result[i] = psutil_windows_wide_to_utf8(args[i], -1);
+        if (result[i] == NULL) {
+            int j;
+            for (j = 0; j < i; j++) {
+                free(result[j]);
+            }
+            free(result);
+            LocalFree(args);
+            psutil_set_last_error(PSUTIL_ERROR_MEMORY);
+            return NULL;
         }
     }
     result[nArgs] = NULL;
 
     LocalFree(args);
-    free(cmdline);
     *count = nArgs;
     return result;
 }
 
 int psutil_windows_process_get_status(Process* proc) {
     if (proc == NULL) {
-        return STATUS_DEAD;
+        return PSUTIL_STATUS_DEAD;
     }
 
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc->pid);
     if (hProcess == NULL) {
-        return STATUS_DEAD;
+        return PSUTIL_STATUS_DEAD;
     }
 
     DWORD exitCode;
     if (!GetExitCodeProcess(hProcess, &exitCode)) {
         CloseHandle(hProcess);
-        return STATUS_DEAD;
+        return PSUTIL_STATUS_DEAD;
     }
 
     CloseHandle(hProcess);
 
     if (exitCode == STILL_ACTIVE) {
         // Process is running
-        return STATUS_RUNNING;
+        return PSUTIL_STATUS_RUNNING;
     } else {
         // Process has exited
-        return STATUS_DEAD;
+        return PSUTIL_STATUS_DEAD;
     }
 }
 
@@ -745,16 +710,35 @@ const char* psutil_windows_process_get_username(Process* proc) {
         PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(size);
         if (pTokenUser != NULL) {
             if (GetTokenInformation(hToken, TokenUser, pTokenUser, size, &size)) {
-                char username[256];
-                char domain[256];
-                DWORD usernameSize = sizeof(username);
-                DWORD domainSize = sizeof(domain);
+                WCHAR username[256];
+                WCHAR domain[256];
+                DWORD usernameSize = 256;
+                DWORD domainSize = 256;
                 SID_NAME_USE sidType;
-                
-                if (LookupAccountSidA(NULL, pTokenUser->User.Sid, username, &usernameSize, domain, &domainSize, &sidType)) {
-                    char fullUsername[512];
-                    snprintf(fullUsername, sizeof(fullUsername), "%s\\%s", domain, username);
-                    proc->username = strdup(fullUsername);
+
+                if (LookupAccountSidW(NULL, pTokenUser->User.Sid, username,
+                                      &usernameSize, domain, &domainSize,
+                                      &sidType)) {
+                    char* user_utf8 = psutil_windows_wide_to_utf8(username, -1);
+                    char* domain_utf8 = psutil_windows_wide_to_utf8(domain, -1);
+                    if (user_utf8 != NULL) {
+                        size_t need = strlen(user_utf8) + 1;
+                        char* full;
+                        if (domain_utf8 != NULL && domain_utf8[0] != '\0') {
+                            need += strlen(domain_utf8) + 1;
+                        }
+                        full = (char*)malloc(need);
+                        if (full != NULL) {
+                            if (domain_utf8 != NULL && domain_utf8[0] != '\0') {
+                                snprintf(full, need, "%s\\%s", domain_utf8, user_utf8);
+                            } else {
+                                snprintf(full, need, "%s", user_utf8);
+                            }
+                            proc->username = full;
+                        }
+                        free(user_utf8);
+                    }
+                    free(domain_utf8);
                 }
             }
             free(pTokenUser);
@@ -807,9 +791,9 @@ const char* psutil_windows_process_get_cwd(Process* proc) {
     // For the current process, use GetCurrentDirectoryA.
     // For other processes, this is complex and requires PEB traversal.
     if (proc->pid == GetCurrentProcessId()) {
-        char cwd[MAX_PATH];
-        if (GetCurrentDirectoryA(MAX_PATH, cwd) > 0) {
-            proc->cwd = strdup(cwd);
+        WCHAR cwd[MAX_PATH];
+        if (GetCurrentDirectoryW(MAX_PATH, cwd) > 0) {
+            proc->cwd = psutil_windows_wide_to_utf8(cwd, -1);
         }
         return proc->cwd;
     }
@@ -1434,7 +1418,11 @@ int psutil_windows_process_get_num_threads(Process* proc) {
     // Use toolhelp32 to count threads
     int num_threads = 0;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnapshot != INVALID_HANDLE_VALUE) {
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        psutil_set_last_error(PSUTIL_ERROR_PERMISSION);
+        return 0;
+    }
+    {
         THREADENTRY32 te;
         te.dwSize = sizeof(THREADENTRY32);
         if (Thread32First(hSnapshot, &te)) {
@@ -1444,76 +1432,89 @@ int psutil_windows_process_get_num_threads(Process* proc) {
                 }
             } while (Thread32Next(hSnapshot, &te));
         }
-        CloseHandle(hSnapshot);
     }
-    
-    return num_threads > 0 ? num_threads : 1;
+    CloseHandle(hSnapshot);
+
+    // Returning 1 when nothing was found (or when the snapshot failed) hid
+    // "process is gone / access denied" behind a plausible-looking number.
+    return num_threads;
 }
 
 psutil_thread* psutil_windows_process_get_threads(Process* proc, int* count) {
-    if (proc == NULL) {
-        *count = 0;
-        return NULL;
-    }
-
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
-        *count = 0;
-        return NULL;
-    }
-
+    HANDLE hSnapshot;
     THREADENTRY32 te;
-    te.dwSize = sizeof(THREADENTRY32);
+    psutil_thread* threads = NULL;
+    int capacity = 0;
+    int index = 0;
 
-    // First pass: count threads
-    int threadCount = 0;
+    *count = 0;
+    if (proc == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return NULL;
+    }
+
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        psutil_set_last_error(PSUTIL_ERROR_PERMISSION);
+        return NULL;
+    }
+
+    // Single pass with a growing array: the old code enumerated the snapshot
+    // twice and could report more threads than it actually filled in.
+    te.dwSize = sizeof(THREADENTRY32);
     if (Thread32First(hSnapshot, &te)) {
         do {
-            if (te.th32OwnerProcessID == proc->pid) {
-                threadCount++;
+            HANDLE hThread;
+            FILETIME create_time, exit_time, kernel_time, user_time;
+
+            if (te.th32OwnerProcessID != proc->pid) {
+                continue;
             }
+
+            if (index >= capacity) {
+                int ncap = (capacity == 0) ? 32 : (capacity * 2);
+                psutil_thread* nt = (psutil_thread*)realloc(
+                    threads, (size_t)ncap * sizeof(psutil_thread));
+                if (nt == NULL) {
+                    free(threads);
+                    CloseHandle(hSnapshot);
+                    psutil_set_last_error(PSUTIL_ERROR_MEMORY);
+                    return NULL;
+                }
+                threads = nt;
+                capacity = ncap;
+            }
+
+            threads[index].id = (uint32_t)te.th32ThreadID;
+            threads[index].user_time = 0.0;
+            threads[index].system_time = 0.0;
+
+            hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+                                 te.th32ThreadID);
+            if (hThread != NULL) {
+                if (GetThreadTimes(hThread, &create_time, &exit_time,
+                                   &kernel_time, &user_time)) {
+                    ULARGE_INTEGER u;
+                    ULARGE_INTEGER k;
+                    u.LowPart = user_time.dwLowDateTime;
+                    u.HighPart = user_time.dwHighDateTime;
+                    k.LowPart = kernel_time.dwLowDateTime;
+                    k.HighPart = kernel_time.dwHighDateTime;
+                    // FILETIME is 100ns ticks since 1601; the API exposes
+                    // seconds of CPU time, so this is a duration, not a
+                    // timestamp: dividing by 10^7 is correct, passing the raw
+                    // FILETIME to FiletimeToUnixTime (as before) was not.
+                    threads[index].user_time = (double)u.QuadPart / 10000000.0;
+                    threads[index].system_time = (double)k.QuadPart / 10000000.0;
+                }
+                CloseHandle(hThread);
+            }
+            index++;
         } while (Thread32Next(hSnapshot, &te));
     }
 
-    if (threadCount == 0) {
-        CloseHandle(hSnapshot);
-        *count = 0;
-        return NULL;
-    }
-
-    // Allocate memory for thread information
-    psutil_thread* threads = (psutil_thread*)malloc(threadCount * sizeof(psutil_thread));
-    if (!threads) {
-        CloseHandle(hSnapshot);
-        *count = 0;
-        return NULL;
-    }
-
-    // Second pass: collect thread information
-    int index = 0;
-    if (Thread32First(hSnapshot, &te)) {
-        do {
-            if (te.th32OwnerProcessID == proc->pid) {
-                threads[index].id = te.th32ThreadID;
-                
-                // Get thread times
-                HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-                if (hThread) {
-                    FILETIME createTime, exitTime, kernelTime, userTime;
-                    if (GetThreadTimes(hThread, &createTime, &exitTime, &kernelTime, &userTime)) {
-                        threads[index].user_time = psutil_FiletimeToUnixTime(userTime);
-                        threads[index].system_time = psutil_FiletimeToUnixTime(kernelTime);
-                    }
-                    CloseHandle(hThread);
-                }
-                
-                index++;
-            }
-        } while (Thread32Next(hSnapshot, &te) && index < threadCount);
-    }
-
     CloseHandle(hSnapshot);
-    *count = threadCount;
+    *count = index;
     return threads;
 }
 
@@ -1860,13 +1861,22 @@ psutil_open_file* psutil_windows_process_get_open_files(Process* proc, int* coun
     return openFiles;
 }
 
-psutil_net_connection* psutil_windows_process_get_net_connections(Process* proc, const char* kind, int* count) {
-    // On Windows, getting per-process network connections requires matching
-    // the global connection table entries to the process PID via the OwnerPid field.
-    // We delegate to the global net_connections and return all connections
-    // since the psutil_net_connection struct does not have a pid field.
-    (void)proc;
-    return psutil_windows_net_connections(kind, count);
+psutil_net_connection* psutil_windows_net_connections(const char* kind, int* count) {
+    return psutil_windows_net_connections_filtered(kind, 0, count);
+}
+
+psutil_net_connection* psutil_windows_process_get_net_connections(Process* proc,
+                                                                  const char* kind,
+                                                                  int* count) {
+    if (proc == NULL) {
+        *count = 0;
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return NULL;
+    }
+    // Rows come from TCP_TABLE_OWNER_PID_ALL / UDP_TABLE_OWNER_PID, so every
+    // entry carries dwOwningPid and can be matched to this process. The old
+    // stub simply returned the whole system table.
+    return psutil_windows_net_connections_filtered(kind, proc->pid, count);
 }
 
 int psutil_windows_process_send_signal(Process* proc, int sig) {
@@ -2003,6 +2013,7 @@ psutil_memory_info psutil_windows_virtual_memory(void) {
     if (GlobalMemoryStatusEx(&memInfo)) {
         info.rss = memInfo.ullTotalPhys - memInfo.ullAvailPhys;
         info.vms = memInfo.ullTotalPhys;
+        info.available = memInfo.ullAvailPhys;
         info.shared = 0;
         info.text = 0;
         info.lib = 0;
@@ -2021,6 +2032,7 @@ psutil_memory_info psutil_windows_swap_memory(void) {
     if (GlobalMemoryStatusEx(&memInfo)) {
         info.rss = memInfo.ullTotalPageFile - memInfo.ullAvailPageFile;
         info.vms = memInfo.ullTotalPageFile;
+        info.available = memInfo.ullAvailPageFile;
         info.shared = 0;
         info.text = 0;
         info.lib = 0;
@@ -2045,7 +2057,9 @@ psutil_cpu_times psutil_windows_cpu_times(int percpu) {
         idle.HighPart = idleTime.dwHighDateTime;
 
         times.user = (double)user.QuadPart / 10000000.0;
+        // GetSystemTimes' kernel time already contains the idle time.
         times.system = (double)(kernel.QuadPart - idle.QuadPart) / 10000000.0;
+        times.idle = (double)idle.QuadPart / 10000000.0;
     }
     return times;
 }
@@ -2133,6 +2147,7 @@ psutil_cpu_times psutil_windows_cpu_times_percent(double interval, int percpu) {
     if (total > 0) {
         times.user = (userDiff / total) * 100.0;
         times.system = ((kernelDiff - idleDiff) / total) * 100.0;
+        times.idle = (idleDiff / total) * 100.0;
     }
 
     return times;
@@ -2228,18 +2243,18 @@ psutil_io_counters psutil_windows_net_io_counters(int pernic) {
 // Helper function to convert TCP state to psutil status
 static int tcp_state_to_status(DWORD state) {
     switch (state) {
-        case MIB_TCP_STATE_CLOSED:     return CONN_CLOSE;
-        case MIB_TCP_STATE_LISTEN:     return CONN_LISTEN;
-        case MIB_TCP_STATE_SYN_SENT:   return CONN_SYN_SENT;
-        case MIB_TCP_STATE_SYN_RCVD:   return CONN_SYN_RECV;
-        case MIB_TCP_STATE_ESTAB:      return CONN_ESTABLISHED;
-        case MIB_TCP_STATE_FIN_WAIT1:  return CONN_FIN_WAIT1;
-        case MIB_TCP_STATE_FIN_WAIT2:  return CONN_FIN_WAIT2;
-        case MIB_TCP_STATE_CLOSE_WAIT: return CONN_CLOSE_WAIT;
-        case MIB_TCP_STATE_CLOSING:    return CONN_CLOSING;
-        case MIB_TCP_STATE_LAST_ACK:   return CONN_LAST_ACK;
-        case MIB_TCP_STATE_TIME_WAIT:  return CONN_TIME_WAIT;
-        default:                       return CONN_NONE;
+        case MIB_TCP_STATE_CLOSED:     return PSUTIL_CONN_CLOSE;
+        case MIB_TCP_STATE_LISTEN:     return PSUTIL_CONN_LISTEN;
+        case MIB_TCP_STATE_SYN_SENT:   return PSUTIL_CONN_SYN_SENT;
+        case MIB_TCP_STATE_SYN_RCVD:   return PSUTIL_CONN_SYN_RECV;
+        case MIB_TCP_STATE_ESTAB:      return PSUTIL_CONN_ESTABLISHED;
+        case MIB_TCP_STATE_FIN_WAIT1:  return PSUTIL_CONN_FIN_WAIT1;
+        case MIB_TCP_STATE_FIN_WAIT2:  return PSUTIL_CONN_FIN_WAIT2;
+        case MIB_TCP_STATE_CLOSE_WAIT: return PSUTIL_CONN_CLOSE_WAIT;
+        case MIB_TCP_STATE_CLOSING:    return PSUTIL_CONN_CLOSING;
+        case MIB_TCP_STATE_LAST_ACK:   return PSUTIL_CONN_LAST_ACK;
+        case MIB_TCP_STATE_TIME_WAIT:  return PSUTIL_CONN_TIME_WAIT;
+        default:                       return PSUTIL_CONN_NONE;
     }
 }
 
@@ -2260,7 +2275,7 @@ static void format_address6(char* buf, size_t buf_size, const UCHAR* addr, DWORD
              ntohs((u_short)port));
 }
 
-psutil_net_connection* psutil_windows_net_connections(const char* kind, int* count) {
+static psutil_net_connection* psutil_windows_net_connections_filtered(const char* kind, psutil_pid_t pid_filter, int* count) {
     *count = 0;
     
     // Determine what types of connections to retrieve
@@ -2307,7 +2322,10 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
                     connections = new_conn;
                 }
                 
-                connections[index].fd = -1;
+
+                if (pid_filter != 0 && tcp_table->table[i].dwOwningPid != (DWORD)pid_filter) {
+                    continue;
+                }               connections[index].fd = -1;
                 connections[index].family = AF_INET;
                 connections[index].type = SOCK_STREAM;
                 format_address(connections[index].laddr, sizeof(connections[index].laddr), 
@@ -2349,7 +2367,10 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
                     connections = new_conn;
                 }
                 
-                connections[index].fd = -1;
+
+                if (pid_filter != 0 && tcp6_table->table[i].dwOwningPid != (DWORD)pid_filter) {
+                    continue;
+                }               connections[index].fd = -1;
                 connections[index].family = AF_INET6;
                 connections[index].type = SOCK_STREAM;
                 format_address6(connections[index].laddr, sizeof(connections[index].laddr), 
@@ -2388,13 +2409,16 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
                     connections = new_conn;
                 }
                 
-                connections[index].fd = -1;
+
+                if (pid_filter != 0 && udp_table->table[i].dwOwningPid != (DWORD)pid_filter) {
+                    continue;
+                }               connections[index].fd = -1;
                 connections[index].family = AF_INET;
                 connections[index].type = SOCK_DGRAM;
                 format_address(connections[index].laddr, sizeof(connections[index].laddr), 
                               udp_table->table[i].dwLocalAddr, udp_table->table[i].dwLocalPort);
                 connections[index].raddr[0] = '\0';
-                connections[index].status = CONN_NONE;
+                connections[index].status = PSUTIL_CONN_NONE;
                 index++;
             }
         }
@@ -2429,13 +2453,16 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
                     connections = new_conn;
                 }
                 
-                connections[index].fd = -1;
+
+                if (pid_filter != 0 && udp6_table->table[i].dwOwningPid != (DWORD)pid_filter) {
+                    continue;
+                }               connections[index].fd = -1;
                 connections[index].family = AF_INET6;
                 connections[index].type = SOCK_DGRAM;
                 format_address6(connections[index].laddr, sizeof(connections[index].laddr), 
                                udp6_table->table[i].ucLocalAddr, udp6_table->table[i].dwLocalPort);
                 connections[index].raddr[0] = '\0';
-                connections[index].status = CONN_NONE;
+                connections[index].status = PSUTIL_CONN_NONE;
                 index++;
             }
         }
@@ -2452,102 +2479,150 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
 }
 
 psutil_net_if_addr* psutil_windows_net_if_addrs(int* count) {
-    *count = 0;
-    
-    // Get adapter addresses
     ULONG flags = GAA_FLAG_INCLUDE_PREFIX;
     ULONG family = AF_UNSPEC;
     PIP_ADAPTER_ADDRESSES adapterAddresses = NULL;
+    psutil_net_if_addr* addrs = NULL;
     ULONG bufferSize = 0;
-    
-    // First call to get buffer size
-    if (g_GetAdaptersAddresses == NULL) {
-        return NULL;
-    }
-    g_GetAdaptersAddresses(family, flags, NULL, NULL, &bufferSize);
-    
-    adapterAddresses = (PIP_ADAPTER_ADDRESSES)malloc(bufferSize);
-    if (adapterAddresses == NULL) {
-        return NULL;
-    }
-    
-    DWORD result = g_GetAdaptersAddresses(family, flags, NULL, adapterAddresses, &bufferSize);
-    if (result != ERROR_SUCCESS) {
-        free(adapterAddresses);
-        return NULL;
-    }
-    
-    // Count addresses
+    DWORD result;
     int capacity = 0;
-    PIP_ADAPTER_ADDRESSES adapter = adapterAddresses;
-    while (adapter != NULL) {
-        PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress;
-        while (unicast != NULL) {
-            capacity++;
-            unicast = unicast->Next;
-        }
-        adapter = adapter->Next;
-    }
-    
-    if (capacity == 0) {
-        free(adapterAddresses);
-        return NULL;
-    }
-    
-    psutil_net_if_addr* addrs = (psutil_net_if_addr*)malloc(capacity * sizeof(psutil_net_if_addr));
-    if (addrs == NULL) {
-        free(adapterAddresses);
-        return NULL;
-    }
-    
     int index = 0;
-    adapter = adapterAddresses;
-    while (adapter != NULL && index < capacity) {
-        // Get interface name
-        char ifName[64] = {0};
-        WideCharToMultiByte(CP_ACP, 0, adapter->FriendlyName, -1, ifName, sizeof(ifName), NULL, NULL);
-        
-        PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress;
-        while (unicast != NULL && index < capacity) {
-            strncpy(addrs[index].name, ifName, sizeof(addrs[index].name) - 1);
-            
-            SOCKET_ADDRESS* sockAddr = &unicast->Address;
-            if (sockAddr->lpSockaddr->sa_family == AF_INET) {
-                struct sockaddr_in* sin = (struct sockaddr_in*)sockAddr->lpSockaddr;
-                strncpy(addrs[index].address, inet_ntoa(sin->sin_addr), sizeof(addrs[index].address) - 1);
-                
-                // Get netmask - use default for compatibility with older Windows versions
-                strncpy(addrs[index].netmask, "255.255.255.0", sizeof(addrs[index].netmask) - 1);
-                
-                // Get broadcast (approximation)
-                strncpy(addrs[index].broadcast, "255.255.255.255", sizeof(addrs[index].broadcast) - 1);
-            } else if (sockAddr->lpSockaddr->sa_family == AF_INET6) {
-                struct sockaddr_in6* sin6 = (struct sockaddr_in6*)sockAddr->lpSockaddr;
-                // Format IPv6 address manually for compatibility with Windows XP
-                // (inet_ntop is not available on XP)
-                const unsigned char* a = sin6->sin6_addr.s6_addr;
-                snprintf(addrs[index].address, sizeof(addrs[index].address),
-                         "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-                         a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-                         a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
-                strncpy(addrs[index].netmask, "", sizeof(addrs[index].netmask) - 1);
-                strncpy(addrs[index].broadcast, "", sizeof(addrs[index].broadcast) - 1);
-            }
-            
-            index++;
-            unicast = unicast->Next;
-        }
-        adapter = adapter->Next;
+    PIP_ADAPTER_ADDRESSES adapter;
+
+    *count = 0;
+    if (g_GetAdaptersAddresses == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_UNSUPPORTED);
+        return NULL;
     }
-    
+
+    // GetAdaptersAddresses wants a buffer big enough for *all* adapters; the
+    // old code allocated exactly what the first (empty) call reported.
+    bufferSize = 16 * 1024;
+    for (;;) {
+        PIP_ADAPTER_ADDRESSES buf = (PIP_ADAPTER_ADDRESSES)malloc(bufferSize);
+        if (buf == NULL) {
+            psutil_set_last_error(PSUTIL_ERROR_MEMORY);
+            return NULL;
+        }
+        result = g_GetAdaptersAddresses(family, flags, NULL, buf, &bufferSize);
+        if (result == ERROR_SUCCESS) {
+            adapterAddresses = buf;
+            break;
+        }
+        free(buf);
+        if (result != ERROR_BUFFER_OVERFLOW) {
+            psutil_set_last_error(PSUTIL_ERROR_IO);
+            return NULL;
+        }
+        bufferSize *= 2;
+    }
+
+    for (adapter = adapterAddresses; adapter != NULL; adapter = adapter->Next) {
+        PIP_ADAPTER_UNICAST_ADDRESS unicast;
+        for (unicast = adapter->FirstUnicastAddress; unicast != NULL;
+             unicast = unicast->Next) {
+            if (index + 2 > capacity) {
+                int ncap = (capacity == 0) ? 32 : (capacity * 2);
+                psutil_net_if_addr* na = (psutil_net_if_addr*)realloc(
+                    addrs, (size_t)ncap * sizeof(psutil_net_if_addr));
+                if (na == NULL) {
+                    free(addrs);
+                    free(adapterAddresses);
+                    psutil_set_last_error(PSUTIL_ERROR_MEMORY);
+                    return NULL;
+                }
+                addrs = na;
+                capacity = ncap;
+            }
+
+            memset(&addrs[index], 0, sizeof(psutil_net_if_addr));
+            {
+                // FriendlyName is UTF-16; CP_ACP produced mojibake for
+                // Chinese adapter names ("以太网" -> garbage).
+                char* name = psutil_windows_wide_to_utf8(adapter->FriendlyName, -1);
+                if (name != NULL) {
+                    snprintf(addrs[index].name, sizeof(addrs[index].name), "%s",
+                             name);
+                    free(name);
+                }
+            }
+
+            {
+                const SOCKADDR* sa = unicast->Address.lpSockaddr;
+                addrs[index].family = sa->sa_family;
+                if (sa->sa_family == AF_INET) {
+                    const struct sockaddr_in* sin = (const struct sockaddr_in*)sa;
+                    uint32_t prefix = unicast->OnLinkPrefixLength;
+                    uint32_t host = ntohl(sin->sin_addr.S_un.S_addr);
+                    uint32_t mask = 0;
+                    uint32_t i;
+                    uint32_t bcast;
+
+                    if (prefix > 32) {
+                        prefix = 32;
+                    }
+                    for (i = 0; i < prefix; i++) {
+                        mask |= (uint32_t)1 << (31 - i);
+                    }
+                    snprintf(addrs[index].address, sizeof(addrs[index].address),
+                             "%u.%u.%u.%u", (unsigned)((host >> 24) & 0xFF),
+                             (unsigned)((host >> 16) & 0xFF),
+                             (unsigned)((host >> 8) & 0xFF),
+                             (unsigned)(host & 0xFF));
+                    psutil_windows_ipv4_mask(prefix, addrs[index].netmask,
+                                             sizeof(addrs[index].netmask));
+                    bcast = host | ~mask;
+                    snprintf(addrs[index].broadcast,
+                             sizeof(addrs[index].broadcast),
+                             "%u.%u.%u.%u", (unsigned)((bcast >> 24) & 0xFF),
+                             (unsigned)((bcast >> 16) & 0xFF),
+                             (unsigned)((bcast >> 8) & 0xFF),
+                             (unsigned)(bcast & 0xFF));
+                } else if (sa->sa_family == AF_INET6) {
+                    const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)sa;
+                    const unsigned char* a = sin6->sin6_addr.s6_addr;
+                    snprintf(addrs[index].address, sizeof(addrs[index].address),
+                             "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+                             a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                             a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
+                    addrs[index].netmask[0] = '\0';
+                    addrs[index].broadcast[0] = '\0';
+                } else {
+                    continue;
+                }
+            }
+            index++;
+
+            // One AF_PACKET-style row per adapter carries the hardware
+            // address, mirroring psutil's per-family ifaddr output.
+            if (adapter->PhysicalAddressLength > 0) {
+                size_t used = 0;
+                DWORD b;
+                memset(&addrs[index], 0, sizeof(psutil_net_if_addr));
+                addrs[index].family = AF_PACKET;
+                snprintf(addrs[index].name, sizeof(addrs[index].name), "%s",
+                         addrs[index - 1].name);
+                for (b = 0; b < adapter->PhysicalAddressLength &&
+                            used + 4 < sizeof(addrs[index].mac); b++) {
+                    used += (size_t)snprintf(addrs[index].mac + used,
+                                             sizeof(addrs[index].mac) - used,
+                                             "%s%02x", (b == 0) ? "" : ":",
+                                             adapter->PhysicalAddress[b]);
+                }
+                addrs[index].address[0] = '\0';
+                addrs[index].netmask[0] = '\0';
+                addrs[index].broadcast[0] = '\0';
+                index++;
+            }
+        }
+    }
+
     free(adapterAddresses);
     *count = index;
-    
     if (index == 0) {
         free(addrs);
         return NULL;
     }
-    
     return addrs;
 }
 
@@ -2587,17 +2662,22 @@ psutil_net_if_stat* psutil_windows_net_if_stats(int* count) {
             continue;
         }
         
-        // Get interface name
-        char ifName[64] = {0};
-        WideCharToMultiByte(CP_ACP, 0, row->wszName, -1, ifName, sizeof(ifName), NULL, NULL);
-        strncpy(stats[index].name, ifName, sizeof(stats[index].name) - 1);
-        
+        // wszName is UTF-16: CP_ACP turned Chinese adapter names into mojibake.
+        memset(&stats[index], 0, sizeof(psutil_net_if_stat));
+        {
+            char* if_name = psutil_windows_wide_to_utf8(row->wszName, -1);
+            if (if_name != NULL) {
+                snprintf(stats[index].name, sizeof(stats[index].name), "%s", if_name);
+                free(if_name);
+            }
+        }
+
         stats[index].isup = (row->dwOperStatus == IF_OPER_STATUS_OPERATIONAL) ? 1 : 0;
         stats[index].speed = (int)(row->dwSpeed / 1000000); // Convert to Mbps
         stats[index].mtu = row->dwMtu;
         
         // Determine duplex (not available in MIB_IFROW, use unknown)
-        stats[index].duplex = NIC_DUPLEX_UNKNOWN;
+        stats[index].duplex = PSUTIL_NIC_DUPLEX_UNKNOWN;
         
         index++;
     }
@@ -2615,56 +2695,82 @@ psutil_net_if_stat* psutil_windows_net_if_stats(int* count) {
 
 psutil_io_counters psutil_windows_disk_io_counters(int perdisk) {
     psutil_io_counters counters = {0};
+    int found = 0;
+    int i;
 
-    // Try to get disk performance using DeviceIoControl
-    HANDLE hDevice = CreateFileA("\\\\.\\PhysicalDrive0", 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                 NULL, OPEN_EXISTING, 0, NULL);
-    if (hDevice != INVALID_HANDLE_VALUE) {
-        DISK_PERFORMANCE diskPerformance;
-        DWORD bytesReturned;
-        if (DeviceIoControl(hDevice, IOCTL_DISK_PERFORMANCE, NULL, 0,
-                           &diskPerformance, sizeof(diskPerformance), &bytesReturned, NULL)) {
-            counters.read_bytes = diskPerformance.BytesRead.QuadPart;
-            counters.write_bytes = diskPerformance.BytesWritten.QuadPart;
-            counters.read_count = diskPerformance.ReadCount;
-            counters.write_count = diskPerformance.WriteCount;
+    (void)perdisk;  // psutil_io_counters has no per-disk breakdown
+    // The old code only ever opened PhysicalDrive0, so every other disk was
+    // silently missing from the totals. IOCTL_DISK_PERFORMANCE must be
+    // requested with 0 access rights, which is what CreateFile below does.
+    for (i = 0; i < 64; i++) {
+        char path[64];
+        HANDLE hDevice;
+        DISK_PERFORMANCE perf;
+        DWORD bytes_returned = 0;
+
+        snprintf(path, sizeof(path), "\\\\.\\PhysicalDrive%d", i);
+        hDevice = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, 0, NULL);
+        if (hDevice == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        found++;
+        memset(&perf, 0, sizeof(perf));
+        if (DeviceIoControl(hDevice, IOCTL_DISK_PERFORMANCE, NULL, 0, &perf,
+                            sizeof(perf), &bytes_returned, NULL)) {
+            counters.read_bytes += perf.BytesRead.QuadPart;
+            counters.write_bytes += perf.BytesWritten.QuadPart;
+            counters.read_count += perf.ReadCount;
+            counters.write_count += perf.WriteCount;
+            // ReadTime/WriteTime are 100ns units; psutil reports milliseconds.
+            counters.read_time += (uint64_t)(perf.ReadTime.QuadPart / 10000);
+            counters.write_time += (uint64_t)(perf.WriteTime.QuadPart / 10000);
         }
         CloseHandle(hDevice);
     }
 
+    if (found == 0) {
+        psutil_set_last_error(PSUTIL_ERROR_PERMISSION);
+    }
     return counters;
 }
-
-psutil_disk_partition* psutil_windows_disk_partitions(int all) {
+psutil_disk_partition* psutil_windows_disk_partitions(int all, int* count) {
     DWORD drives = GetLogicalDrives();
+
+    if (count == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return NULL;
+    }
+    *count = 0;
     if (drives == 0) {
+        psutil_set_last_error(PSUTIL_ERROR_IO);
         return NULL;
     }
 
     // Count partitions first
-    int count = 0;
+    int npartitions = 0;
     for (int i = 0; i < 26; i++) {
         if (drives & (1 << i)) {
             char drivePath[4] = {'A' + i, ':', '\\', '\0'};
             UINT driveType = GetDriveTypeA(drivePath);
             if (all || driveType == DRIVE_FIXED || driveType == DRIVE_REMOTE) {
-                count++;
+                npartitions++;
             }
         }
     }
 
-    if (count == 0) {
+    if (npartitions == 0) {
         return NULL;
     }
 
     // Allocate array (extra element for terminator)
-    psutil_disk_partition* partitions = (psutil_disk_partition*)malloc((count + 1) * sizeof(psutil_disk_partition));
+    psutil_disk_partition* partitions = (psutil_disk_partition*)malloc((npartitions + 1) * sizeof(psutil_disk_partition));
     if (partitions == NULL) {
         return NULL;
     }
 
     int index = 0;
-    for (int i = 0; i < 26 && index < count; i++) {
+    for (int i = 0; i < 26 && index < npartitions; i++) {
         if (drives & (1 << i)) {
             char drivePath[4] = {'A' + i, ':', '\\', '\0'};
             char mountPoint[4] = {'A' + i, ':', '\\', '\0'};
@@ -2712,8 +2818,12 @@ psutil_disk_partition* psutil_windows_disk_partitions(int all) {
         }
     }
 
+    // Report how many entries were actually filled in (the old signature
+    // forced callers to rely on a NUL-terminated device name).
+    *count = index;
+
     // Mark end of array
-    if (index < count + 1) {
+    if (index < npartitions + 1) {
         partitions[index].device[0] = '\0';
     }
 
@@ -2722,12 +2832,33 @@ psutil_disk_partition* psutil_windows_disk_partitions(int all) {
 
 psutil_disk_usage psutil_windows_disk_usage(const char* path) {
     psutil_disk_usage usage = {0};
-    ULARGE_INTEGER freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes;
-    if (GetDiskFreeSpaceExA(path, &freeBytesAvailable, &totalNumberOfBytes, &totalNumberOfFreeBytes)) {
-        usage.total = totalNumberOfBytes.QuadPart;
-        usage.free = totalNumberOfFreeBytes.QuadPart;
-        usage.used = usage.total - usage.free;
-        usage.percent = (double)usage.used / usage.total * 100.0;
+    ULARGE_INTEGER free_bytes_available, total_bytes, total_free_bytes;
+    WCHAR wpath[MAX_PATH * 2];
+
+    if (path == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return usage;
+    }
+    // Paths coming from the rest of the library are UTF-8, so convert instead
+    // of calling the A variant (which mis-parses non-ASCII directories).
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath,
+                            (int)(sizeof(wpath) / sizeof(WCHAR))) <= 0) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return usage;
+    }
+    if (!GetDiskFreeSpaceExW(wpath, &free_bytes_available, &total_bytes,
+                             &total_free_bytes)) {
+        psutil_set_last_error(PSUTIL_ERROR_IO);
+        return usage;
+    }
+
+    usage.total = total_bytes.QuadPart;
+    usage.free = total_free_bytes.QuadPart;
+    usage.used = (usage.total > usage.free) ? (usage.total - usage.free) : 0;
+    if (usage.total > 0) {
+        // Dividing by total without this guard produced inf/NaN for empty
+        // or not-ready removable drives.
+        usage.percent = (double)usage.used / (double)usage.total * 100.0;
     }
     return usage;
 }
@@ -2771,18 +2902,34 @@ psutil_user* psutil_windows_users(int* count) {
         // Get username
         if (g_WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId, WTSUserName, &username, &bytesReturned)) {
             if (username != NULL && wcslen(username) > 0) {
-                // Convert username to char
-                WideCharToMultiByte(CP_ACP, 0, username, -1, users[index].name, sizeof(users[index].name), NULL, NULL);
-                
+                memset(&users[index], 0, sizeof(psutil_user));
+
+                // Convert username to char (UTF-8: the rest of this library
+                // returns UTF-8, CP_ACP produced garbage for non-ASCII logins)
+                {
+                    char* user_utf8 = psutil_windows_wide_to_utf8(username, -1);
+                    if (user_utf8 != NULL) {
+                        snprintf(users[index].name, sizeof(users[index].name),
+                                 "%s", user_utf8);
+                        free(user_utf8);
+                    }
+                }
+
                 // Get domain
                 if (g_WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId, WTSDomainName, &domain, &bytesReturned)) {
                     if (domain != NULL && wcslen(domain) > 0) {
-                        char domainStr[64] = {0};
-                        WideCharToMultiByte(CP_ACP, 0, domain, -1, domainStr, sizeof(domainStr), NULL, NULL);
-                        // Prepend domain to username
-                        char fullName[128];
-                        snprintf(fullName, sizeof(fullName), "%s\\%s", domainStr, users[index].name);
-                        strncpy(users[index].name, fullName, sizeof(users[index].name) - 1);
+                        char domain_str[64];
+                        char full_name[sizeof(users[index].name)];
+                        char* domain_utf8 = psutil_windows_wide_to_utf8(domain, -1);
+                        if (domain_utf8 != NULL) {
+                            snprintf(domain_str, sizeof(domain_str), "%s",
+                                     domain_utf8);
+                            snprintf(full_name, sizeof(full_name), "%s\\%s",
+                                     domain_str, users[index].name);
+                            snprintf(users[index].name,
+                                     sizeof(users[index].name), "%s", full_name);
+                            free(domain_utf8);
+                        }
                     }
                     g_WTSFreeMemory(domain);
                 }
@@ -2791,13 +2938,36 @@ psutil_user* psutil_windows_users(int* count) {
                 LPWSTR stationName = NULL;
                 if (g_WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId, WTSWinStationName, &stationName, &bytesReturned)) {
                     if (stationName != NULL) {
-                        WideCharToMultiByte(CP_ACP, 0, stationName, -1, users[index].terminal, sizeof(users[index].terminal), NULL, NULL);
+                        char* term_utf8 = psutil_windows_wide_to_utf8(stationName, -1);
+                        if (term_utf8 != NULL) {
+                            snprintf(users[index].terminal,
+                                     sizeof(users[index].terminal), "%s",
+                                     term_utf8);
+                            free(term_utf8);
+                        }
                         g_WTSFreeMemory(stationName);
                     }
                 }
                 
-                // Get logon time (use current time as approximation)
+                // Logon time: WTSSessionInfo carries the real logon timestamp.
+                // The old code substituted time(NULL), i.e. the moment the
+                // query ran, which is always wrong.
                 users[index].started = (double)time(NULL);
+                {
+                    PWTSINFO info = NULL;
+                    DWORD info_bytes = 0;
+                    if (g_WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,
+                                                      sessions[i].SessionId,
+                                                      WTSSessionInfo, (LPWSTR*)&info,
+                                                      &info_bytes) &&
+                        info != NULL) {
+                        FILETIME ft;
+                        ft.dwLowDateTime = (DWORD)(info->LogonTime.QuadPart & 0xFFFFFFFFu);
+                        ft.dwHighDateTime = (DWORD)(info->LogonTime.QuadPart >> 32);
+                        users[index].started = psutil_FiletimeToUnixTime(ft);
+                        g_WTSFreeMemory(info);
+                    }
+                }
                 
                 index++;
             }
@@ -2838,3 +3008,16 @@ double psutil_windows_boot_time(void) {
     
     return bootTime;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+

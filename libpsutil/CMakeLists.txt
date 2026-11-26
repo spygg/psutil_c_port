@@ -22,14 +22,19 @@ elseif(APPLE)
     set(PSUTIL_PLATFORM_SOURCES "arch/macos/psutil_macos.c")
     set(PSUTIL_PLATFORM_HEADERS "arch/macos/psutil_macos.h")
     set(PSUTIL_LIBRARIES "")
-elseif(${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD|NetBSD|OpenBSD|DragonFly")
+elseif(${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
+    # The BSD backend is FreeBSD-specific (kvm_getprocs, sysctl KERN_PROC,
+    # kinfo_proc layout). It does not build on NetBSD/OpenBSD/DragonFly, so
+    # fail loudly instead of producing a library that cannot link.
     set(PSUTIL_PLATFORM "bsd")
     set(PSUTIL_PLATFORM_DEFINE "PSUTIL_BSD")
     set(PSUTIL_PLATFORM_DIR "arch/bsd")
     set(PSUTIL_PLATFORM_SOURCES "arch/bsd/psutil_bsd.c")
     set(PSUTIL_PLATFORM_HEADERS "arch/bsd/psutil_bsd.h")
-    # BSD may need kvm for process listing
-    set(PSUTIL_LIBRARIES "")
+    set(PSUTIL_LIBRARIES "kvm")
+elseif(${CMAKE_SYSTEM_NAME} MATCHES "NetBSD|OpenBSD|DragonFly")
+    message(FATAL_ERROR "libpsutil: only FreeBSD is supported in arch/bsd "
+                        "(${CMAKE_SYSTEM_NAME} needs its own backend)")
 elseif(ANDROID)
     # Android must be checked before Linux since Android also defines CMAKE_SYSTEM_NAME as Linux
     set(PSUTIL_PLATFORM "android")
@@ -68,7 +73,9 @@ add_library(psutil STATIC
     ${PSUTIL_PLATFORM_SOURCES}
 )
 
-target_compile_definitions(psutil PRIVATE ${PSUTIL_PLATFORM_DEFINE})
+# PUBLIC on purpose: consumers that include psutil.h compile the same inline
+# branches as the library, so the platform macro must not be library-private.
+target_compile_definitions(psutil PUBLIC ${PSUTIL_PLATFORM_DEFINE})
 
 # MSVC: suppress CRT warnings (strncpy, sscanf, strdup, etc.)
 if(MSVC)
@@ -77,10 +84,13 @@ if(MSVC)
     set_target_properties(psutil PROPERTIES C_STANDARD 11)
 endif()
 
-# MinGW: target Windows XP (0x0501) for maximum compatibility
+# Windows: the code uses Vista+ APIs (PROCESS_QUERY_LIMITED_INFORMATION,
+# GetTickCount64, GetLogicalProcessorInformationEx), so 0x0501 (XP) hid
+# declarations and produced implicit-declaration errors.
+if(WIN32)
+    target_compile_definitions(psutil PRIVATE _WIN32_WINNT=0x0600 WINVER=0x0600)
+endif()
 if(MINGW)
-    target_compile_definitions(psutil PRIVATE _WIN32_WINNT=0x0501 WINVER=0x0501)
-    # MinGW needs _GNU_SOURCE for some functions like strdup
     target_compile_definitions(psutil PRIVATE _GNU_SOURCE)
 endif()
 
@@ -94,16 +104,24 @@ if(PSUTIL_LIBRARIES)
     target_link_libraries(psutil ${PSUTIL_LIBRARIES})
 endif()
 
+# Warnings on GCC/Clang. -Wextra is what caught several of the fixed bugs
+# (uninitialised counters, unused parameters).
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(psutil PRIVATE -Wall -Wextra)
+    set_target_properties(psutil PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+endif()
+
 # Installation
 install(TARGETS psutil
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
 
-install(FILES psutil.h ${PSUTIL_PLATFORM_HEADERS}
-    DESTINATION include/psutil
-)
+# Only the public header is installed. arch/*.h are internal: they include
+# "../../psutil.h" and would be broken once copied into include/psutil.
+install(FILES psutil.h DESTINATION include/psutil)
 
 # Export platform-specific variables to parent scope
 set(PSUTIL_LIBRARIES ${PSUTIL_LIBRARIES} PARENT_SCOPE)
 set(PSUTIL_PLATFORM_DEFINE ${PSUTIL_PLATFORM_DEFINE} PARENT_SCOPE)
+

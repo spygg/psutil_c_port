@@ -57,7 +57,7 @@ int main() {
     double vmem_total_gb = vmem.vms / (1024.0 * 1024.0 * 1024.0);
     printf("Virtual memory: total=%.2f GB, available=%.2f GB, used=%.2f GB, usage=%.2f%%\n", 
            vmem_total_gb, 
-           vmem.shared / (1024.0 * 1024.0 * 1024.0),
+           (double)vmem.available / (1024.0 * 1024.0 * 1024.0),
            vmem.rss / (1024.0 * 1024.0 * 1024.0), 
            vmem_total_gb > 0.0 ? (double)vmem.rss / vmem.vms * 100.0 : 0.0);
     
@@ -74,14 +74,8 @@ int main() {
     
     // Disk partitions
     int part_count = 0;
-    psutil_disk_partition* partitions = disk_partitions(1);
+    psutil_disk_partition* partitions = disk_partitions(1, &part_count);
     if (partitions != NULL) {
-        // Count partitions by checking device[0] != '\0'
-        // Note: disk_partitions returns a pointer to an array, not necessarily NULL-terminated.
-        // We rely on the count returned by the function if available, or scan until empty.
-        for (int i = 0; partitions[i].device[0] != '\0'; i++) {
-            part_count++;
-        }
         for (int i = 0; i < part_count; i++) {
             printf("Partition: device=%s, mountpoint=%s, fstype=%s\n", 
                    partitions[i].device, partitions[i].mountpoint, partitions[i].fstype);

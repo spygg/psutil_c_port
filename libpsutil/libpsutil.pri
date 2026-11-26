@@ -18,10 +18,13 @@ contains(QMAKE_PLATFORM, android) | contains(ANDROID_ABI, .*) {
     DEFINES += PSUTIL_ANDROID
     SOURCES += $$PSUTIL_LIBDIR/arch/android/psutil_android.c
     HEADERS += $$PSUTIL_LIBDIR/arch/android/psutil_android.h
-} else:contains(QMAKE_PLATFORM, freebsd|netbsd|openbsd|dragonfly) {
+} else:contains(QMAKE_PLATFORM, freebsd) {
     DEFINES += PSUTIL_BSD
     SOURCES += $$PSUTIL_LIBDIR/arch/bsd/psutil_bsd.c
     HEADERS += $$PSUTIL_LIBDIR/arch/bsd/psutil_bsd.h
+} else:contains(QMAKE_PLATFORM, netbsd|openbsd|dragonfly) {
+    # arch/bsd is FreeBSD-only; these platforms need their own backend.
+    error("libpsutil: only FreeBSD is supported by arch/bsd")
 } else:linux {
     DEFINES += PSUTIL_LINUX
     SOURCES += $$PSUTIL_LIBDIR/arch/linux/psutil_linux.c
@@ -55,13 +58,16 @@ win32 {
     # Exported for the including .pro to link into its target as well
     PSUTIL_LIBRARIES = -lpsapi -liphlpapi -lwtsapi32 -ladvapi32 -lws2_32 -luserenv
 
+    # Vista+ APIs are used (PROCESS_QUERY_LIMITED_INFORMATION, GetTickCount64),
+    # so the 0x0501 (XP) target hid the declarations and broke the build.
+    DEFINES += _WIN32_WINNT=0x0600 WINVER=0x0600
+
     MSVC {
         # MSVC: suppress CRT deprecation warnings (strncpy, sscanf, strdup, ...)
         DEFINES += _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS
     } else:mingw {
-        # MinGW: target Windows XP (0x0501) for maximum compatibility.
         # _GNU_SOURCE exposes strdup and other GNU extensions.
-        DEFINES += _WIN32_WINNT=0x0501 WINVER=0x0501 _GNU_SOURCE
+        DEFINES += _GNU_SOURCE
     }
 }
 
@@ -70,3 +76,4 @@ linux {
     # utmp members; _DEFAULT_SOURCE keeps glibc from hiding other APIs.
     DEFINES += _GNU_SOURCE _DEFAULT_SOURCE
 }
+

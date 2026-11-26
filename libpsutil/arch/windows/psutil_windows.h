@@ -220,9 +220,10 @@ psutil_net_connection* psutil_windows_net_connections(const char* kind, int* cou
 psutil_net_if_addr* psutil_windows_net_if_addrs(int* count);
 psutil_net_if_stat* psutil_windows_net_if_stats(int* count);
 psutil_io_counters psutil_windows_disk_io_counters(int perdisk);
-psutil_disk_partition* psutil_windows_disk_partitions(int all);
+psutil_disk_partition* psutil_windows_disk_partitions(int all, int* count);
 psutil_disk_usage psutil_windows_disk_usage(const char* path);
 psutil_user* psutil_windows_users(int* count);
 double psutil_windows_boot_time(void);
 
 #endif // PSUTIL_WINDOWS_H
+

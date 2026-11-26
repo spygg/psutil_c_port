@@ -31,44 +31,81 @@ extern "C" {
 // ====================================================================
 // --- Constants
 // ====================================================================
+// Prefixed names are canonical. Short names are kept for backward
+// compatibility; define PSUTIL_NO_SHORT_MACROS before including this
+// header to keep the global namespace clean (Windows SDK / Qt safe).
+// The library itself always uses the prefixed names.
 
 // Process status constants
-#define STATUS_RUNNING 0
-#define STATUS_IDLE 1
-#define STATUS_SLEEPING 2
-#define STATUS_DISK_SLEEP 3
-#define STATUS_STOPPED 4
-#define STATUS_TRACING_STOP 5
-#define STATUS_ZOMBIE 6
-#define STATUS_DEAD 7
-#define STATUS_WAKING 8
-#define STATUS_LOCKED 9
-#define STATUS_WAITING 10
-#define STATUS_PARKED 11
-#define STATUS_WAKE_KILL 12
+#define PSUTIL_STATUS_RUNNING 0
+#define PSUTIL_STATUS_IDLE 1
+#define PSUTIL_STATUS_SLEEPING 2
+#define PSUTIL_STATUS_DISK_SLEEP 3
+#define PSUTIL_STATUS_STOPPED 4
+#define PSUTIL_STATUS_TRACING_STOP 5
+#define PSUTIL_STATUS_ZOMBIE 6
+#define PSUTIL_STATUS_DEAD 7
+#define PSUTIL_STATUS_WAKING 8
+#define PSUTIL_STATUS_LOCKED 9
+#define PSUTIL_STATUS_WAITING 10
+#define PSUTIL_STATUS_PARKED 11
+#define PSUTIL_STATUS_WAKE_KILL 12
 
 // Connection status constants
-#define CONN_ESTABLISHED 1
-#define CONN_SYN_SENT 2
-#define CONN_SYN_RECV 3
-#define CONN_FIN_WAIT1 4
-#define CONN_FIN_WAIT2 5
-#define CONN_TIME_WAIT 6
-#define CONN_CLOSE 7
-#define CONN_CLOSE_WAIT 8
-#define CONN_LAST_ACK 9
-#define CONN_LISTEN 10
-#define CONN_CLOSING 11
-#define CONN_NONE 128
+#define PSUTIL_CONN_ESTABLISHED 1
+#define PSUTIL_CONN_SYN_SENT 2
+#define PSUTIL_CONN_SYN_RECV 3
+#define PSUTIL_CONN_FIN_WAIT1 4
+#define PSUTIL_CONN_FIN_WAIT2 5
+#define PSUTIL_CONN_TIME_WAIT 6
+#define PSUTIL_CONN_CLOSE 7
+#define PSUTIL_CONN_CLOSE_WAIT 8
+#define PSUTIL_CONN_LAST_ACK 9
+#define PSUTIL_CONN_LISTEN 10
+#define PSUTIL_CONN_CLOSING 11
+#define PSUTIL_CONN_NONE 128
 
 // Network interface duplex constants
-#define NIC_DUPLEX_FULL 0
-#define NIC_DUPLEX_HALF 1
-#define NIC_DUPLEX_UNKNOWN 2
+#define PSUTIL_NIC_DUPLEX_FULL 0
+#define PSUTIL_NIC_DUPLEX_HALF 1
+#define PSUTIL_NIC_DUPLEX_UNKNOWN 2
 
 // Power time constants
-#define POWER_TIME_UNKNOWN -1
-#define POWER_TIME_UNLIMITED -2
+#define PSUTIL_POWER_TIME_UNKNOWN -1
+#define PSUTIL_POWER_TIME_UNLIMITED -2
+
+#ifndef PSUTIL_NO_SHORT_MACROS
+#define STATUS_RUNNING PSUTIL_STATUS_RUNNING
+#define STATUS_IDLE PSUTIL_STATUS_IDLE
+#define STATUS_SLEEPING PSUTIL_STATUS_SLEEPING
+#define STATUS_DISK_SLEEP PSUTIL_STATUS_DISK_SLEEP
+#define STATUS_STOPPED PSUTIL_STATUS_STOPPED
+#define STATUS_TRACING_STOP PSUTIL_STATUS_TRACING_STOP
+#define STATUS_ZOMBIE PSUTIL_STATUS_ZOMBIE
+#define STATUS_DEAD PSUTIL_STATUS_DEAD
+#define STATUS_WAKING PSUTIL_STATUS_WAKING
+#define STATUS_LOCKED PSUTIL_STATUS_LOCKED
+#define STATUS_WAITING PSUTIL_STATUS_WAITING
+#define STATUS_PARKED PSUTIL_STATUS_PARKED
+#define STATUS_WAKE_KILL PSUTIL_STATUS_WAKE_KILL
+#define CONN_ESTABLISHED PSUTIL_CONN_ESTABLISHED
+#define CONN_SYN_SENT PSUTIL_CONN_SYN_SENT
+#define CONN_SYN_RECV PSUTIL_CONN_SYN_RECV
+#define CONN_FIN_WAIT1 PSUTIL_CONN_FIN_WAIT1
+#define CONN_FIN_WAIT2 PSUTIL_CONN_FIN_WAIT2
+#define CONN_TIME_WAIT PSUTIL_CONN_TIME_WAIT
+#define CONN_CLOSE PSUTIL_CONN_CLOSE
+#define CONN_CLOSE_WAIT PSUTIL_CONN_CLOSE_WAIT
+#define CONN_LAST_ACK PSUTIL_CONN_LAST_ACK
+#define CONN_LISTEN PSUTIL_CONN_LISTEN
+#define CONN_CLOSING PSUTIL_CONN_CLOSING
+#define CONN_NONE PSUTIL_CONN_NONE
+#define NIC_DUPLEX_FULL PSUTIL_NIC_DUPLEX_FULL
+#define NIC_DUPLEX_HALF PSUTIL_NIC_DUPLEX_HALF
+#define NIC_DUPLEX_UNKNOWN PSUTIL_NIC_DUPLEX_UNKNOWN
+#define POWER_TIME_UNKNOWN PSUTIL_POWER_TIME_UNKNOWN
+#define POWER_TIME_UNLIMITED PSUTIL_POWER_TIME_UNLIMITED
+#endif // PSUTIL_NO_SHORT_MACROS
 
 // ====================================================================
 // --- Types
@@ -98,6 +135,9 @@ typedef struct {
     double system;
     double children_user;
     double children_system;
+    /* Aggregated system-wide idle time (seconds). Needed to compute a
+     * meaningful percentage; per-process cpu_times leave it at 0. */
+    double idle;
 } psutil_cpu_times;
 
 typedef struct {
@@ -110,6 +150,10 @@ typedef struct {
     uint64_t dirty;
     uint64_t uss;
     uint64_t pss;
+    /* Memory the OS considers immediately reclaimable. macOS filled this in
+     * and failed to compile against a struct that lacked it; Linux and
+     * Windows now report it too, and it is what "used" is derived from. */
+    uint64_t available;
 } psutil_memory_info;
 
 typedef struct {
@@ -170,6 +214,10 @@ typedef struct Process {
     double create_time;
     psutil_pid_t ppid;
     int status;
+    /* Backend-private state (e.g. a cached /proc/<pid>/stat parse).
+     * Owned by process_new()/process_free()/process_refresh(); the caller
+     * must never dereference or free it. */
+    void* _platform;
 } Process;
 
 // Create a new Process object for the given PID
@@ -178,6 +226,12 @@ Process* process_new(psutil_pid_t pid);
 
 // Free a Process object
 void process_free(Process* proc);
+
+// Drop every cached field of the object so the next getter re-reads it.
+// Call it before reusing a Process across a long period: PIDs are
+// recycled and cached name/exe/username/create_time would otherwise
+// describe a previous owner of the same PID.
+void process_refresh(Process* proc);
 
 // Get the process PID
 psutil_pid_t process_get_pid(Process* proc);
@@ -248,8 +302,9 @@ char** process_get_environ(Process* proc, int* count);
 // Free a string array returned by process_get_cmdline or process_get_environ
 void psutil_free_string_array(char** arr, int count);
 
-// Free a pointer array returned by pids, net_if_addrs, net_if_stats, etc.
-// For arrays of structs (not arrays of pointers), simply call free().
+// Arrays of structs (pids, net_connections, net_if_addrs, net_if_stats,
+// disk_partitions, users, memory_maps, open_files, threads, cpu affinity)
+// are released with a single free() call.
 
 // Get the number of handles opened by the process (Windows only)
 int process_get_num_handles(Process* proc);
@@ -316,10 +371,10 @@ int pid_exists(psutil_pid_t pid);
 psutil_pid_t* pids(int* count);
 
 // Get virtual memory information
-psutil_memory_info virtual_memory();
+psutil_memory_info virtual_memory(void);
 
 // Get swap memory information
-psutil_memory_info swap_memory();
+psutil_memory_info swap_memory(void);
 
 // Get CPU times
 psutil_cpu_times cpu_times(int percpu);
@@ -341,7 +396,7 @@ typedef struct {
     uint64_t syscalls;
 } psutil_cpu_stats;
 
-psutil_cpu_stats cpu_stats();
+psutil_cpu_stats cpu_stats(void);
 
 // Get network I/O counters
 psutil_io_counters net_io_counters(int pernic);
@@ -356,6 +411,9 @@ typedef struct {
     char address[256];
     char netmask[256];
     char broadcast[256];
+    /* Hardware address ("aa:bb:cc:dd:ee:ff"). Filled for AF_PACKET rows and
+     * left empty on plain AF_INET / AF_INET6 rows. */
+    char mac[64];
 } psutil_net_if_addr;
 
 psutil_net_if_addr* net_if_addrs(int* count);
@@ -382,7 +440,10 @@ typedef struct {
     char opts[256];
 } psutil_disk_partition;
 
-psutil_disk_partition* disk_partitions(int all);
+// Get disk partitions. Returns an array of *count entries (never with a
+// sentinel element); caller must free() it. *count is 0 when nothing is
+// found or on error (see psutil_last_error()).
+psutil_disk_partition* disk_partitions(int all, int* count);
 
 // Get disk usage
 typedef struct {
@@ -405,13 +466,34 @@ typedef struct {
 psutil_user* users(int* count);
 
 // Get boot time
-double boot_time();
+double boot_time(void);
 
 // ====================================================================
-// --- Library initialization
+// --- Library initialization and error reporting
 // ====================================================================
 int psutil_init(void);
 void psutil_cleanup(void);
+
+// Error codes reported by psutil_last_error()
+#define PSUTIL_OK 0
+#define PSUTIL_ERROR_MEMORY -1
+#define PSUTIL_ERROR_PERMISSION -2
+#define PSUTIL_ERROR_NOT_FOUND -3
+#define PSUTIL_ERROR_UNSUPPORTED -4
+#define PSUTIL_ERROR_IO -5
+#define PSUTIL_ERROR_INVALID_ARG -6
+
+// Last error recorded by this library on the *calling thread*.
+// Returns PSUTIL_OK if the last operation succeeded.
+int psutil_last_error(void);
+
+// Clear the per-thread error explicitly. The error is sticky: it is only
+// overwritten by the next failing call, so read it right after the call you
+// care about (a later successful call does not reset it).
+void psutil_clear_error(void);
+
+// Internal helper used by the platform backends; not part of the API.
+void psutil_set_last_error(int err);
 
 // ====================================================================
 // --- Platform-specific functions
@@ -442,3 +524,5 @@ void psutil_cleanup(void);
 #endif
 
 #endif // PSUTIL_H
+
+

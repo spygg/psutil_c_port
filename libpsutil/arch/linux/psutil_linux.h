@@ -89,7 +89,7 @@ psutil_net_connection* psutil_linux_net_connections(const char* kind, int* count
 psutil_net_if_addr* psutil_linux_net_if_addrs(int* count);
 psutil_net_if_stat* psutil_linux_net_if_stats(int* count);
 psutil_io_counters psutil_linux_disk_io_counters(int perdisk);
-psutil_disk_partition* psutil_linux_disk_partitions(int all);
+psutil_disk_partition* psutil_linux_disk_partitions(int all, int* count);
 psutil_disk_usage psutil_linux_disk_usage(const char* path);
 psutil_user* psutil_linux_users(int* count);
 double psutil_linux_boot_time(void);

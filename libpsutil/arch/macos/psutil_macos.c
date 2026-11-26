@@ -127,13 +127,14 @@ Process* psutil_macos_process_new(psutil_pid_t pid) {
     }
 
     proc->pid = pid;
+    proc->_platform = NULL;   // no per-process cache on this backend
     proc->name = NULL;
     proc->exe = NULL;
     proc->cwd = NULL;
     proc->username = NULL;
     proc->create_time = 0.0;
     proc->ppid = 0;
-    proc->status = STATUS_RUNNING;
+    proc->status = PSUTIL_STATUS_RUNNING;
 
     return proc;
 }
@@ -300,7 +301,7 @@ char** psutil_macos_process_get_cmdline(Process* proc, int* count) {
 
 int psutil_macos_process_get_status(Process* proc) {
     if (proc == NULL) {
-        return STATUS_RUNNING;
+        return PSUTIL_STATUS_RUNNING;
     }
     
     struct kinfo_proc kp;
@@ -310,20 +311,20 @@ int psutil_macos_process_get_status(Process* proc) {
     if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0 && len > 0) {
         switch (kp.kp_proc.p_stat) {
             case SIDL:
-                return STATUS_IDLE;
+                return PSUTIL_STATUS_IDLE;
             case SRUN:
-                return STATUS_RUNNING;
+                return PSUTIL_STATUS_RUNNING;
             case SSLEEP:
-                return STATUS_SLEEPING;
+                return PSUTIL_STATUS_SLEEPING;
             case SSTOP:
-                return STATUS_STOPPED;
+                return PSUTIL_STATUS_STOPPED;
             case SZOMB:
-                return STATUS_ZOMBIE;
+                return PSUTIL_STATUS_ZOMBIE;
             default:
-                return STATUS_RUNNING;
+                return PSUTIL_STATUS_RUNNING;
         }
     }
-    return STATUS_RUNNING;
+    return PSUTIL_STATUS_RUNNING;
 }
 
 const char* psutil_macos_process_get_username(Process* proc) {
@@ -968,6 +969,17 @@ psutil_memory_info psutil_macos_swap_memory(void) {
     return info;
 }
 
+static double psutil_macos_clk_tck(void) {
+    static long tck = 0;
+    if (tck <= 0) {
+        tck = sysconf(_SC_CLK_TCK);
+        if (tck <= 0) {
+            tck = 100;
+        }
+    }
+    return (double)tck;
+}
+
 psutil_cpu_times psutil_macos_cpu_times(int percpu) {
     psutil_cpu_times times = {0};
     
@@ -979,9 +991,11 @@ psutil_cpu_times psutil_macos_cpu_times(int percpu) {
     if (kr == KERN_SUCCESS) {
         // Convert from mach ticks to seconds
         // mach ticks are typically 1/100 of a second
-        times.user = (double)cpu_info.cpu_ticks[CPU_STATE_USER] / 100.0;
-        times.system = (double)cpu_info.cpu_ticks[CPU_STATE_SYSTEM] / 100.0;
-        times.idle = (double)cpu_info.cpu_ticks[CPU_STATE_IDLE] / 100.0;
+        // HOST_CPU_LOAD_INFO ticks are in CLK_TCK units; 100 is only the
+        // usual value, not a guarantee.
+        times.user = (double)cpu_info.cpu_ticks[CPU_STATE_USER] / psutil_macos_clk_tck();
+        times.system = (double)cpu_info.cpu_ticks[CPU_STATE_SYSTEM] / psutil_macos_clk_tck();
+        times.idle = (double)cpu_info.cpu_ticks[CPU_STATE_IDLE] / psutil_macos_clk_tck();
     }
     
     return times;
@@ -1135,18 +1149,18 @@ psutil_io_counters psutil_macos_net_io_counters(int pernic) {
 // Helper function to convert TCP state to psutil status
 static int tcp_state_to_status(int state) {
     switch (state) {
-        case TCPS_CLOSED:     return CONN_CLOSE;
-        case TCPS_LISTEN:     return CONN_LISTEN;
-        case TCPS_SYN_SENT:   return CONN_SYN_SENT;
-        case TCPS_SYN_RECEIVED: return CONN_SYN_RECV;
-        case TCPS_ESTABLISHED: return CONN_ESTABLISHED;
-        case TCPS_CLOSE_WAIT: return CONN_CLOSE_WAIT;
-        case TCPS_FIN_WAIT_1: return CONN_FIN_WAIT1;
-        case TCPS_CLOSING:    return CONN_CLOSING;
-        case TCPS_LAST_ACK:   return CONN_LAST_ACK;
-        case TCPS_FIN_WAIT_2: return CONN_FIN_WAIT2;
-        case TCPS_TIME_WAIT:  return CONN_TIME_WAIT;
-        default:              return CONN_NONE;
+        case TCPS_CLOSED:     return PSUTIL_CONN_CLOSE;
+        case TCPS_LISTEN:     return PSUTIL_CONN_LISTEN;
+        case TCPS_SYN_SENT:   return PSUTIL_CONN_SYN_SENT;
+        case TCPS_SYN_RECEIVED: return PSUTIL_CONN_SYN_RECV;
+        case TCPS_ESTABLISHED: return PSUTIL_CONN_ESTABLISHED;
+        case TCPS_CLOSE_WAIT: return PSUTIL_CONN_CLOSE_WAIT;
+        case TCPS_FIN_WAIT_1: return PSUTIL_CONN_FIN_WAIT1;
+        case TCPS_CLOSING:    return PSUTIL_CONN_CLOSING;
+        case TCPS_LAST_ACK:   return PSUTIL_CONN_LAST_ACK;
+        case TCPS_FIN_WAIT_2: return PSUTIL_CONN_FIN_WAIT2;
+        case TCPS_TIME_WAIT:  return PSUTIL_CONN_TIME_WAIT;
+        default:              return PSUTIL_CONN_NONE;
     }
 }
 
@@ -1260,7 +1274,7 @@ psutil_net_connection* psutil_macos_net_connections(const char* kind, int* count
                             connections[index].laddr[0] = '\0';
                         }
                         connections[index].raddr[0] = '\0';
-                        connections[index].status = CONN_NONE;
+                        connections[index].status = PSUTIL_CONN_NONE;
                         index++;
                     }
                     ptr += xig->xig_len;
@@ -1416,7 +1430,7 @@ psutil_net_if_stat* psutil_macos_net_if_stats(int* count) {
                 stats[index].isup = (ifm2->ifm_data.ifi_flags & IFF_UP) ? 1 : 0;
                 stats[index].speed = (int)(ifm2->ifm_data.ifi_baudrate / 1000000);
                 stats[index].mtu = ifm2->ifm_data.ifi_mtu;
-                stats[index].duplex = NIC_DUPLEX_UNKNOWN;
+                stats[index].duplex = PSUTIL_NIC_DUPLEX_UNKNOWN;
                 index++;
             }
         }
@@ -1439,16 +1453,21 @@ psutil_io_counters psutil_macos_disk_io_counters(int perdisk) {
     return counters;
 }
 
-psutil_disk_partition* psutil_macos_disk_partitions(int all) {
+psutil_disk_partition* psutil_macos_disk_partitions(int all, int* count) {
+    if (count == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return NULL;
+    }
+    *count = 0;
     struct statfs *mounts;
-    int count = getmntinfo(&mounts, MNT_NOWAIT);
-    if (count <= 0) {
+    int nmounts = getmntinfo(&mounts, MNT_NOWAIT);
+    if (nmounts <= 0) {
         return NULL;
     }
 
     // Count valid entries
     int valid_count = 0;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < nmounts; i++) {
         const char *fstype = mounts[i].f_fstypename;
         if (all || (
             strcmp(fstype, "hfs") == 0 ||
@@ -1476,7 +1495,7 @@ psutil_disk_partition* psutil_macos_disk_partitions(int all) {
     }
 
     int index = 0;
-    for (int i = 0; i < count && index < valid_count; i++) {
+    for (int i = 0; i < nmounts && index < valid_count; i++) {
         const char *fstype = mounts[i].f_fstypename;
         if (all || (
             strcmp(fstype, "hfs") == 0 ||
@@ -1520,6 +1539,7 @@ psutil_disk_partition* psutil_macos_disk_partitions(int all) {
         partitions[index].device[0] = '\0';
     }
 
+    *count = index;
     return partitions;
 }
 
@@ -1608,3 +1628,6 @@ double psutil_macos_boot_time(void) {
 
     return 0.0;
 }
+
+
+

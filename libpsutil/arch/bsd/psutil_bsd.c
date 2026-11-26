@@ -102,13 +102,14 @@ Process* psutil_bsd_process_new(psutil_pid_t pid) {
     }
 
     proc->pid = pid;
+    proc->_platform = NULL;   // no per-process cache on this backend
     proc->name = NULL;
     proc->exe = NULL;
     proc->cwd = NULL;
     proc->username = NULL;
     proc->create_time = 0.0;
     proc->ppid = 0;
-    proc->status = STATUS_RUNNING;
+    proc->status = PSUTIL_STATUS_RUNNING;
 
     return proc;
 }
@@ -257,7 +258,7 @@ char** psutil_bsd_process_get_cmdline(Process* proc, int* count) {
 
 int psutil_bsd_process_get_status(Process* proc) {
     if (proc == NULL) {
-        return STATUS_RUNNING;
+        return PSUTIL_STATUS_RUNNING;
     }
     
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, proc->pid};
@@ -267,20 +268,20 @@ int psutil_bsd_process_get_status(Process* proc) {
     if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0) {
         switch (kp.ki_stat) {
             case SRUN:
-                return STATUS_RUNNING;
+                return PSUTIL_STATUS_RUNNING;
             case SSLEEP:
             case SSTOP:
-                return STATUS_SLEEPING;
+                return PSUTIL_STATUS_SLEEPING;
             case SZOMB:
-                return STATUS_ZOMBIE;
+                return PSUTIL_STATUS_ZOMBIE;
             case SIDL:
-                return STATUS_IDLE;
+                return PSUTIL_STATUS_IDLE;
             default:
-                return STATUS_RUNNING;
+                return PSUTIL_STATUS_RUNNING;
         }
     }
     
-    return STATUS_RUNNING;
+    return PSUTIL_STATUS_RUNNING;
 }
 
 const char* psutil_bsd_process_get_username(Process* proc) {
@@ -969,18 +970,18 @@ psutil_io_counters psutil_bsd_net_io_counters(int pernic) {
 // Helper function to convert TCP state to psutil status
 static int tcp_state_to_status(int state) {
     switch (state) {
-        case TCPS_CLOSED:     return CONN_CLOSE;
-        case TCPS_LISTEN:     return CONN_LISTEN;
-        case TCPS_SYN_SENT:   return CONN_SYN_SENT;
-        case TCPS_SYN_RECEIVED: return CONN_SYN_RECV;
-        case TCPS_ESTABLISHED: return CONN_ESTABLISHED;
-        case TCPS_CLOSE_WAIT: return CONN_CLOSE_WAIT;
-        case TCPS_FIN_WAIT_1: return CONN_FIN_WAIT1;
-        case TCPS_CLOSING:    return CONN_CLOSING;
-        case TCPS_LAST_ACK:   return CONN_LAST_ACK;
-        case TCPS_FIN_WAIT_2: return CONN_FIN_WAIT2;
-        case TCPS_TIME_WAIT:  return CONN_TIME_WAIT;
-        default:              return CONN_NONE;
+        case TCPS_CLOSED:     return PSUTIL_CONN_CLOSE;
+        case TCPS_LISTEN:     return PSUTIL_CONN_LISTEN;
+        case TCPS_SYN_SENT:   return PSUTIL_CONN_SYN_SENT;
+        case TCPS_SYN_RECEIVED: return PSUTIL_CONN_SYN_RECV;
+        case TCPS_ESTABLISHED: return PSUTIL_CONN_ESTABLISHED;
+        case TCPS_CLOSE_WAIT: return PSUTIL_CONN_CLOSE_WAIT;
+        case TCPS_FIN_WAIT_1: return PSUTIL_CONN_FIN_WAIT1;
+        case TCPS_CLOSING:    return PSUTIL_CONN_CLOSING;
+        case TCPS_LAST_ACK:   return PSUTIL_CONN_LAST_ACK;
+        case TCPS_FIN_WAIT_2: return PSUTIL_CONN_FIN_WAIT2;
+        case TCPS_TIME_WAIT:  return PSUTIL_CONN_TIME_WAIT;
+        default:              return PSUTIL_CONN_NONE;
     }
 }
 
@@ -1094,7 +1095,7 @@ psutil_net_connection* psutil_bsd_net_connections(const char* kind, int* count) 
                             connections[index].laddr[0] = '\0';
                         }
                         connections[index].raddr[0] = '\0';
-                        connections[index].status = CONN_NONE;
+                        connections[index].status = PSUTIL_CONN_NONE;
                         index++;
                     }
                     ptr += xig->xig_len;
@@ -1219,7 +1220,7 @@ psutil_net_if_stat* psutil_bsd_net_if_stats(int* count) {
         stats[index].isup = (ifmd.ifmd_data.ifi_flags & IFF_UP) ? 1 : 0;
         stats[index].speed = (int)(ifmd.ifmd_data.ifi_baudrate / 1000000);
         stats[index].mtu = ifmd.ifmd_data.ifi_mtu;
-        stats[index].duplex = NIC_DUPLEX_UNKNOWN;
+        stats[index].duplex = PSUTIL_NIC_DUPLEX_UNKNOWN;
         index++;
     }
     
@@ -1263,16 +1264,21 @@ psutil_io_counters psutil_bsd_disk_io_counters(int perdisk) {
     return counters;
 }
 
-psutil_disk_partition* psutil_bsd_disk_partitions(int all) {
+psutil_disk_partition* psutil_bsd_disk_partitions(int all, int* count) {
+    if (count == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return NULL;
+    }
+    *count = 0;
     struct statfs *mounts;
-    int count = getmntinfo(&mounts, MNT_NOWAIT);
-    if (count <= 0) {
+    int nmounts = getmntinfo(&mounts, MNT_NOWAIT);
+    if (nmounts <= 0) {
         return NULL;
     }
 
     // Count valid entries
     int valid_count = 0;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < nmounts; i++) {
         const char *fstype = mounts[i].f_fstypename;
         if (all || (
             strcmp(fstype, "ufs") == 0 ||
@@ -1300,7 +1306,7 @@ psutil_disk_partition* psutil_bsd_disk_partitions(int all) {
     }
 
     int index = 0;
-    for (int i = 0; i < count && index < valid_count; i++) {
+    for (int i = 0; i < nmounts && index < valid_count; i++) {
         const char *fstype = mounts[i].f_fstypename;
         if (all || (
             strcmp(fstype, "ufs") == 0 ||
@@ -1344,6 +1350,7 @@ psutil_disk_partition* psutil_bsd_disk_partitions(int all) {
         partitions[index].device[0] = '\0';
     }
 
+    *count = index;
     return partitions;
 }
 
@@ -1419,3 +1426,5 @@ double psutil_bsd_boot_time(void) {
     
     return 0.0;
 }
+
+

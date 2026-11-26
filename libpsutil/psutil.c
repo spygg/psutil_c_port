@@ -30,27 +30,63 @@
 #include "arch/bsd/psutil_bsd.h"
 #endif
 
+// Mutually exclusive platform selection. If the build defines more than
+// one of these, the dispatch below would silently pick the wrong one.
+#if (defined(PSUTIL_WINDOWS) + defined(PSUTIL_LINUX) + defined(PSUTIL_ANDROID) + defined(PSUTIL_MACOS) + defined(PSUTIL_BSD)) > 1
+#error "More than one PSUTIL_<PLATFORM> macro is defined - check your build flags"
+#endif
+
+// ====================================================================
+// --- Per-thread error reporting
+// ====================================================================
+
+#if defined(_MSC_VER)
+#define PSUTIL_THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#define PSUTIL_THREAD_LOCAL __thread
+#else
+#define PSUTIL_THREAD_LOCAL
+#endif
+
+static PSUTIL_THREAD_LOCAL int g_psutil_last_error = PSUTIL_OK;
+
+void psutil_set_last_error(int err) {
+    g_psutil_last_error = err;
+}
+
+int psutil_last_error(void) {
+    return g_psutil_last_error;
+}
+
+void psutil_clear_error(void) {
+    g_psutil_last_error = PSUTIL_OK;
+}
+
 // ====================================================================
 // --- Process class implementation
 // ====================================================================
 
 Process* process_new(psutil_pid_t pid) {
+    Process* proc = NULL;
+
+    psutil_clear_error();
 #ifdef PSUTIL_WINDOWS
-    return psutil_windows_process_new(pid);
+    proc = psutil_windows_process_new(pid);
 #elif defined(PSUTIL_LINUX)
-    return psutil_linux_process_new(pid);
+    proc = psutil_linux_process_new(pid);
 #elif defined(PSUTIL_ANDROID)
-    return psutil_android_process_new(pid);
+    proc = psutil_android_process_new(pid);
 #elif defined(PSUTIL_MACOS)
-    return psutil_macos_process_new(pid);
+    proc = psutil_macos_process_new(pid);
 #elif defined(PSUTIL_BSD)
-    return psutil_bsd_process_new(pid);
+    proc = psutil_bsd_process_new(pid);
 #else
-    Process* proc = (Process*)malloc(sizeof(Process));
+    proc = (Process*)malloc(sizeof(Process));
     if (proc == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_MEMORY);
         return NULL;
     }
-    
+
     // If pid is 0, use current process PID
     if (pid == 0) {
 #ifdef __unix__
@@ -59,7 +95,7 @@ Process* process_new(psutil_pid_t pid) {
         pid = GetCurrentProcessId();
 #endif
     }
-    
+
     proc->pid = pid;
     proc->name = NULL;
     proc->exe = NULL;
@@ -67,10 +103,14 @@ Process* process_new(psutil_pid_t pid) {
     proc->username = NULL;
     proc->create_time = 0.0;
     proc->ppid = 0;
-    proc->status = STATUS_RUNNING;
-    
-    return proc;
+    proc->status = PSUTIL_STATUS_RUNNING;
+    proc->_platform = NULL;
 #endif
+
+    if (proc == NULL && psutil_last_error() == PSUTIL_OK) {
+        psutil_set_last_error(PSUTIL_ERROR_NOT_FOUND);
+    }
+    return proc;
 }
 
 void process_free(Process* proc) {
@@ -103,6 +143,37 @@ void process_free(Process* proc) {
     
     free(proc);
 #endif
+}
+
+void process_refresh(Process* proc) {
+    if (proc == NULL) {
+        return;
+    }
+    if (proc->name != NULL) {
+        free(proc->name);
+        proc->name = NULL;
+    }
+    if (proc->exe != NULL) {
+        free(proc->exe);
+        proc->exe = NULL;
+    }
+    if (proc->cwd != NULL) {
+        free(proc->cwd);
+        proc->cwd = NULL;
+    }
+    if (proc->username != NULL) {
+        free(proc->username);
+        proc->username = NULL;
+    }
+    proc->create_time = 0.0;
+    proc->ppid = 0;
+    proc->status = PSUTIL_STATUS_RUNNING;
+    /* _platform is a single heap block owned by the backend cache; every
+     * backend allocates it with malloc/calloc, so free() is safe here. */
+    if (proc->_platform != NULL) {
+        free(proc->_platform);
+        proc->_platform = NULL;
+    }
 }
 
 psutil_pid_t process_get_pid(Process* proc) {
@@ -164,6 +235,7 @@ const char* process_get_exe(Process* proc) {
 }
 
 char** process_get_cmdline(Process* proc, int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_process_get_cmdline(proc, count);
 #elif defined(PSUTIL_LINUX)
@@ -392,6 +464,7 @@ int process_set_ionice(Process* proc, int ioclass, int value) {
 }
 
 int* process_get_cpu_affinity(Process* proc, int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_process_get_cpu_affinity(proc, count);
 #elif defined(PSUTIL_LINUX)
@@ -441,6 +514,7 @@ int process_get_cpu_num(Process* proc) {
 }
 
 char** process_get_environ(Process* proc, int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_process_get_environ(proc, count);
 #elif defined(PSUTIL_LINUX)
@@ -507,6 +581,7 @@ int process_get_num_threads(Process* proc) {
 }
 
 psutil_thread* process_get_threads(Process* proc, int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_process_get_threads(proc, count);
 #elif defined(PSUTIL_LINUX)
@@ -591,6 +666,7 @@ double process_get_memory_percent(Process* proc, const char* memtype) {
 }
 
 psutil_memory_map* process_get_memory_maps(Process* proc, int* count, int grouped) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_process_get_memory_maps(proc, count, grouped);
 #elif defined(PSUTIL_LINUX)
@@ -608,6 +684,7 @@ psutil_memory_map* process_get_memory_maps(Process* proc, int* count, int groupe
 }
 
 psutil_open_file* process_get_open_files(Process* proc, int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_process_get_open_files(proc, count);
 #elif defined(PSUTIL_LINUX)
@@ -625,6 +702,7 @@ psutil_open_file* process_get_open_files(Process* proc, int* count) {
 }
 
 psutil_net_connection* process_get_net_connections(Process* proc, const char* kind, int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_process_get_net_connections(proc, kind, count);
 #elif defined(PSUTIL_LINUX)
@@ -774,6 +852,7 @@ int pid_exists(psutil_pid_t pid) {
 }
 
 psutil_pid_t* pids(int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_pids(count);
 #elif defined(PSUTIL_LINUX)
@@ -790,7 +869,7 @@ psutil_pid_t* pids(int* count) {
 #endif
 }
 
-psutil_memory_info virtual_memory() {
+psutil_memory_info virtual_memory(void) {
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_virtual_memory();
 #elif defined(PSUTIL_LINUX)
@@ -807,7 +886,7 @@ psutil_memory_info virtual_memory() {
 #endif
 }
 
-psutil_memory_info swap_memory() {
+psutil_memory_info swap_memory(void) {
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_swap_memory();
 #elif defined(PSUTIL_LINUX)
@@ -890,7 +969,7 @@ int cpu_count(int logical) {
 #endif
 }
 
-psutil_cpu_stats cpu_stats() {
+psutil_cpu_stats cpu_stats(void) {
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_cpu_stats();
 #elif defined(PSUTIL_LINUX)
@@ -925,6 +1004,7 @@ psutil_io_counters net_io_counters(int pernic) {
 }
 
 psutil_net_connection* net_connections(const char* kind, int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_net_connections(kind, count);
 #elif defined(PSUTIL_LINUX)
@@ -942,6 +1022,7 @@ psutil_net_connection* net_connections(const char* kind, int* count) {
 }
 
 psutil_net_if_addr* net_if_addrs(int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_net_if_addrs(count);
 #elif defined(PSUTIL_LINUX)
@@ -959,6 +1040,7 @@ psutil_net_if_addr* net_if_addrs(int* count) {
 }
 
 psutil_net_if_stat* net_if_stats(int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_net_if_stats(count);
 #elif defined(PSUTIL_LINUX)
@@ -992,22 +1074,28 @@ psutil_io_counters disk_io_counters(int perdisk) {
 #endif
 }
 
-psutil_disk_partition* disk_partitions(int all) {
+psutil_disk_partition* disk_partitions(int all, int* count) {
+    if (count == NULL) {
+        psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG);
+        return NULL;
+    }
+    psutil_clear_error();
 #ifdef PSUTIL_WINDOWS
-    return psutil_windows_disk_partitions(all);
+    return psutil_windows_disk_partitions(all, count);
 #elif defined(PSUTIL_LINUX)
-    return psutil_linux_disk_partitions(all);
+    return psutil_linux_disk_partitions(all, count);
 #elif defined(PSUTIL_ANDROID)
-    return psutil_android_disk_partitions(all);
+    return psutil_android_disk_partitions(all, count);
 #elif defined(PSUTIL_MACOS)
-    return psutil_macos_disk_partitions(all);
+    return psutil_macos_disk_partitions(all, count);
 #elif defined(PSUTIL_BSD)
-    return psutil_bsd_disk_partitions(all);
+    return psutil_bsd_disk_partitions(all, count);
 #else
+    *count = 0;
+    psutil_set_last_error(PSUTIL_ERROR_UNSUPPORTED);
     return NULL;
 #endif
 }
-
 psutil_disk_usage disk_usage(const char* path) {
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_disk_usage(path);
@@ -1026,6 +1114,7 @@ psutil_disk_usage disk_usage(const char* path) {
 }
 
 psutil_user* users(int* count) {
+    if (count == NULL) { psutil_set_last_error(PSUTIL_ERROR_INVALID_ARG); return NULL; }
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_users(count);
 #elif defined(PSUTIL_LINUX)
@@ -1042,7 +1131,7 @@ psutil_user* users(int* count) {
 #endif
 }
 
-double boot_time() {
+double boot_time(void) {
 #ifdef PSUTIL_WINDOWS
     return psutil_windows_boot_time();
 #elif defined(PSUTIL_LINUX)
@@ -1094,3 +1183,6 @@ void psutil_free_string_array(char** arr, int count) {
     }
     free(arr);
 }
+
+
+
